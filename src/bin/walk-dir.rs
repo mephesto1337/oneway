@@ -13,7 +13,7 @@ fn main() -> io::Result<()> {
 
     let entries = find_files(path, true, |_p| {
         return true;
-    });
+    })?;
     for entry in &entries {
         println!("{}", entry.display());
     }
