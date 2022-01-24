@@ -5,14 +5,19 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[[bin]]
+[[example]]
 name = "walk-dir"
 
 [features]
 default = []
+encryption = []
+
+[dev-dependencies]
+env_logger = "0.9"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "time", "fs"] }
-nom = "7"
 log = "0.4"
-env_logger = "0.9"
+bincode = "1.3"
+serde = "1"
+serde_derive = "1"

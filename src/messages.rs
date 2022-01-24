@@ -1,8 +1,10 @@
-use std::io;
-use std::mem;
+use serde_derive::{Deserialize, Serialize};
+
+use crate::config::Config;
+use crate::error::Result;
 
 /// Message send from the client to server
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
     /// Hello message to start a new session
     Hello,
@@ -16,26 +18,83 @@ pub enum Message {
     /// A single file been uploaded
     File {
         filename: String,
-        size: u64,
+        content: Vec<u8>,
         created: u64,
-        id: u64,
     },
+}
 
-    /// A Chunk of a file
-    FileData { id: u64, offset: u64, data: Vec<u8> },
+#[derive(Serialize, Deserialize)]
+struct Envelope {
+    emission_count: u8,
+    current_emission: u8,
+    message: Vec<u8>,
+}
+
+/// Yields each chunk to send
+pub(crate) struct EnvelopeIterator<'c> {
+    /// The inner envelope message beeing sent
+    envelope: Envelope,
+
+    /// A owned buffer to avoid realloctions and to allow fragmentation
+    buffer: Vec<u8>,
+
+    /// Next offset to send, if none we must rebuild the buffer first
+    offset: Option<usize>,
+
+    /// A reference to the configuration beeing used
+    config: &'c Config,
+}
+
+impl<'c> EnvelopeIterator<'c> {
+    fn new(message: &Message, config: &'c Config) -> Result<Self> {
+        let raw_message = bincode::serialize(message)?;
+        let emission_count: u8 = config.remission_count.try_into()?;
+
+        let envelope = Envelope {
+            emission_count,
+            current_emission: 0,
+            message: raw_message,
+        };
+        let serialized_size: usize = bincode::serialized_size(&envelope)?.try_into()?;
+        let buffer = Vec::with_capacity(serialized_size);
+        let offset = None;
+
+        Ok(Self {
+            envelope,
+            buffer,
+            offset,
+            config,
+        })
+    }
+
+    pub(crate) fn get_next_envelope(&mut self) -> Option<&[u8]> {
+        if let Some(offset) = self.offset.take() {
+            let mtu = self.config.mtu;
+            let chunk = &self.buffer[offset..][..mtu];
+            if offset + mtu > self.buffer.len() {
+                self.offset = None;
+            } else {
+                self.offset = Some(offset + mtu);
+            }
+            Some(chunk)
+        } else {
+            // We must rebuild our buffer
+            if self.envelope.current_emission < self.envelope.emission_count {
+                bincode::serialize_into(&mut self.buffer, &self.envelope)
+                    .expect("Could not serialize an Envelope");
+                self.envelope.current_emission += 1;
+                self.offset = Some(0);
+                let chunk = &self.buffer[..self.config.mtu];
+                Some(chunk)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 impl Message {
-    fn serialize_into(&self, buffer: &mut [u8]) -> io::Result<()> {
-        todo!();
-    }
-
-    /// Returns a hint on how much space it needs for serializations
-    fn size(&self) -> usize {
-        let size = match self {
-            Self::Hello => 0,
-            _ => todo!(),
-        };
-        size + mem::size_of::<u32>()
+    pub(crate) fn get_envelopes<'c>(&self, config: &'c Config) -> Result<EnvelopeIterator<'c>> {
+        Ok(EnvelopeIterator::new(self, config)?)
     }
 }

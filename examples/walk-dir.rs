@@ -1,7 +1,7 @@
+use oneway::error::Result;
 use oneway::tree::find_files;
-use std::io;
 
-fn main() -> io::Result<()> {
+fn main() -> Result<()> {
     env_logger::init();
 
     let path = std::env::args()
