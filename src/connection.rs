@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 
 use crate::messages::Message;
-use crate::error::Result;
+use crate::envelope::{EnvelopeHeader, EnvelopeIterator};
+use crate::error::{Result, Error};
 use crate::config::Config;
 
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncWrite, AsyncWriteExt, AsyncRead, AsyncReadExt, BufReader};
+use tokio::time;
 
 pub struct Client<W> {
     writer: W,
@@ -22,12 +24,13 @@ where
 
     pub fn new_with_config(writer: W, config: Config) -> Self {
         // SAFETY: any memory representation of a u64 is a valid one
-        let keep_alive = unsafe { crate::utils::get_random_number().assume_init() };
+        let keep_alive = unsafe { crate::utils::get_random().assume_init() };
         Self { writer, config, keep_alive }
     }
 
     async fn send_message(&mut self, message: Message) -> Result<()> {
-        let mut envelope_iter = message.get_envelopes(&self.config)?;
+        let raw_message = bincode::serialize(&message)?;
+        let mut envelope_iter = EnvelopeIterator::new(&raw_message[..], &self.config)?;
         while let Some(raw_enveloppe) = envelope_iter.get_next_envelope() {
             self.writer.write_all(raw_enveloppe).await?;
         }
@@ -64,3 +67,82 @@ where
         Ok(())
     }
 }
+
+pub struct Server<R> {
+    reader: BufReader<R>,
+    config: Config,
+}
+
+impl<R> Server<R>
+where
+    R: AsyncRead + std::marker::Unpin,
+{
+    pub fn new(reader: R) -> Self {
+        Self::new_with_config(reader, Config::default())
+    }
+
+    pub fn new_with_config(reader: R, config: Config) -> Self {
+        Self { reader: BufReader::new(reader), config }
+    }
+
+    /// Returns:
+    ///   Ok(true) if the read was a success
+    ///   Ok(false) if a timeout occured
+    ///   Err(_) if trouble
+    async fn recv_exact(&mut self, buf: &mut [u8]) -> Result<bool> {
+        let sleep = time::sleep(self.config.recv_timeout.clone());
+        tokio::pin!(sleep);
+
+        tokio::select! {
+            _ = self.reader.read_exact(buf) => {
+                return Ok(true)
+            }
+            _ = &mut sleep => {
+                return Ok(false)
+            }
+        }
+
+    }
+
+    async fn recv_envelope(&mut self) -> Result<Vec<u8>> {
+        let envelope_header_size = EnvelopeHeader::size();
+        let mut envelopes = Vec::with_capacity(self.config.remission_count);
+        let mut envelope_buffer = Vec::with_capacity(envelope_header_size);
+
+        loop {
+            if !self.recv_exact(&mut envelope_buffer[..]).await? {
+                break;
+            }
+            let envelope: EnvelopeHeader = bincode::deserialize(&envelope_buffer[..])?;
+            let mut data = Vec::with_capacity(envelope.size as usize);
+            if !self.recv_exact(&mut data[..]).await? {
+                break;
+            }
+
+            envelopes.push((envelope, data));
+
+            if envelope.emission_count == envelope.emission_count {
+                break;
+            }
+        }
+
+        if let Some((_, data1)) = envelopes.pop() {
+            for (_, data) in &envelopes {
+                if data != &data1 {
+                    log::warn!("Got different data for the same chunk");
+                    log::debug!("reference: {:x?}", data1);
+                    log::debug!("different: {:x?}", data);
+                }
+            }
+            Ok(data1)
+        } else {
+            Err(Error::NoData)
+        }
+    }
+
+    pub async fn recv_message(&mut self) -> Result<Message> {
+        todo!();
+    }
+}
+
+

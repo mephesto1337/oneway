@@ -15,9 +15,11 @@ fn get_unix_inode(path: &Path) -> io::Result<u64> {
 
 #[cfg(target_os = "windows")]
 fn get_windows_inode(path: &Path) -> io::Result<u64> {
+    use std::mem::MaybeUninit;
     use std::os::windows::io::{AsRawHandle, RawHandle};
 
     #[allow(non_camel_case_types)]
+    #[allow(non_snake_case)]
     #[repr(C)]
     struct BY_HANDLE_FILE_INFORMATION {
         _FileAttributes: u32,
@@ -35,12 +37,12 @@ fn get_windows_inode(path: &Path) -> io::Result<u64> {
         fn GetFileInformationByHandle(
             handle: RawHandle,
             file_information: *mut BY_HANDLE_FILE_INFORMATION,
-        ) -> u32;
+        ) -> BOOL;
     }
 
     let file = fs::File::open(path)?;
     let handle = file.as_raw_handle();
-    let mut file_information = std::mem::MaybeUninit::uninit::<BY_HANDLE_FILE_INFORMATION>();
+    let mut file_information: MaybeUninit<BY_HANDLE_FILE_INFORMATION> = MaybeUninit::uninit();
 
     // SAFETY: `handle` is a valid file handle and file_information has the right size
     let ret = unsafe { GetFileInformationByHandle(handle, file_information.as_mut_ptr()) };
