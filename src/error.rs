@@ -27,6 +27,9 @@ pub enum Error {
 
     /// No chunk was received
     NoData,
+
+    /// Missing parts
+    MissingData(std::ops::Range<usize>),
 }
 
 pub type Result<T> = ::std::result::Result<T, Error>;
@@ -94,6 +97,7 @@ impl fmt::Display for Error {
             }
             Self::ParseInt(ref e) => fmt::Display::fmt(e, f),
             Self::NoData => write!(f, "No chunk was received"),
+            Self::MissingData(ref r) => write!(f, "Missing data from {} to {}", r.start, r.end),
         }
     }
 }

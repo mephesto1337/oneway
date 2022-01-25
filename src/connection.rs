@@ -104,7 +104,7 @@ where
 
     }
 
-    async fn recv_envelope(&mut self) -> Result<Vec<u8>> {
+    async fn recv_envelope(&mut self) -> Result<(EnvelopeHeader, Vec<u8>)> {
         let envelope_header_size = EnvelopeHeader::size();
         let mut envelopes = Vec::with_capacity(self.config.remission_count);
         let mut envelope_buffer = Vec::with_capacity(envelope_header_size);
@@ -119,14 +119,15 @@ where
                 break;
             }
 
+            let should_break = envelope.emission_count == envelope.current_emission;
             envelopes.push((envelope, data));
 
-            if envelope.emission_count == envelope.emission_count {
+            if should_break {
                 break;
             }
         }
 
-        if let Some((_, data1)) = envelopes.pop() {
+        if let Some((envelope1, data1)) = envelopes.pop() {
             for (_, data) in &envelopes {
                 if data != &data1 {
                     log::warn!("Got different data for the same chunk");
@@ -134,15 +135,34 @@ where
                     log::debug!("different: {:x?}", data);
                 }
             }
-            Ok(data1)
+            Ok((envelope1, data1))
         } else {
             Err(Error::NoData)
         }
     }
 
     pub async fn recv_message(&mut self) -> Result<Message> {
-        todo!();
+        let mut buffer = Vec::with_capacity(self.config.mtu);
+
+        let (header, data) = self.recv_envelope().await?;
+        if header.offset != 0 {
+            return Err(Error::MissingData(buffer.len()..header.offset as usize));
+        }
+
+        buffer.write(&data[..]).await.expect("Memory write should never fail");
+        while (buffer.len() as u64) < header.total_size {
+            let (next_header, data) = self.recv_envelope().await?;
+            if next_header.offset as usize != buffer.len() {
+                return Err(Error::MissingData(buffer.len()..header.offset as usize));
+            }
+            buffer.write(&data[..]).await.expect("Memory write should never fail");
+        }
+
+        let message = bincode::deserialize(&buffer[..])?;
+
+        Ok(message)
     }
+
 }
 
 

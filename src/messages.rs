@@ -1,8 +1,5 @@
 use serde_derive::{Deserialize, Serialize};
 
-use crate::config::Config;
-use crate::error::Result;
-
 /// Message send from the client to server
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
@@ -18,7 +15,7 @@ pub enum Message {
     /// A single file been uploaded
     File {
         filename: String,
-        content: Vec<u8>,
         created: u64,
+        content: Vec<u8>,
     },
 }

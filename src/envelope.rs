@@ -12,6 +12,7 @@ pub struct EnvelopeHeader {
     pub current_emission: u8,
     pub offset: u16,
     pub size: u16,
+    pub total_size: u64,
 }
 
 impl EnvelopeHeader {
@@ -21,10 +22,11 @@ impl EnvelopeHeader {
         let cached_size = ENVELOPE_HEADER_SIZE.load(Ordering::Relaxed);
         if cached_size == 0 {
             let eh = EnvelopeHeader {
-                emission_count: 1,
-                current_emission: 2,
+                emission_count: 2,
+                current_emission: 1,
                 offset: 3,
                 size: 4,
+                total_size: 5,
             };
             let size = bincode::serialized_size(&eh).expect("Cannot guess size of EnvelopeHeader")
                 as usize;
@@ -37,7 +39,7 @@ impl EnvelopeHeader {
 }
 
 /// Yields each chunk to send
-pub struct EnvelopeIterator<'c, 'd> {
+pub struct EnvelopeIterator<'d> {
     /// The actual data being sent
     data: &'d [u8],
 
@@ -47,15 +49,12 @@ pub struct EnvelopeIterator<'c, 'd> {
     /// The envelope header
     header: EnvelopeHeader,
 
-    /// A reference to the configuration beeing used
-    config: &'c Config,
-
     /// Chunk size used (the value is just cached to avoid getting it several times)
     chunk_size: usize,
 }
 
-impl<'c, 'd> EnvelopeIterator<'c, 'd> {
-    pub fn new(data: &'d [u8], config: &'c Config) -> Result<Self> {
+impl<'d> EnvelopeIterator<'d> {
+    pub fn new(data: &'d [u8], config: &Config) -> Result<Self> {
         let envelope_header_size = EnvelopeHeader::size();
         let chunk_size = if data.len() + envelope_header_size > config.mtu {
             config.mtu - envelope_header_size
@@ -66,9 +65,10 @@ impl<'c, 'd> EnvelopeIterator<'c, 'd> {
 
         let header = EnvelopeHeader {
             emission_count: config.remission_count.try_into()?,
-            current_emission: 0,
+            current_emission: 1,
             offset: 0,
             size: 0,
+            total_size: data.len() as u64,
         };
 
         Ok(Self {
@@ -76,7 +76,6 @@ impl<'c, 'd> EnvelopeIterator<'c, 'd> {
             buffer,
             header,
             chunk_size,
-            config,
         })
     }
 
@@ -92,7 +91,7 @@ impl<'c, 'd> EnvelopeIterator<'c, 'd> {
 
     pub(crate) fn get_next_envelope(&mut self) -> Option<&[u8]> {
         self.buffer.clear();
-        if self.header.current_emission < self.header.emission_count {
+        if self.header.current_emission <= self.header.emission_count {
             let chunk = self.get_chunk();
             self.header.size = chunk.len().try_into().expect("Chunk size too big?!");
             bincode::serialize_into(&mut self.buffer, &self.header)
@@ -103,7 +102,7 @@ impl<'c, 'd> EnvelopeIterator<'c, 'd> {
         } else {
             let offset = self.header.offset as usize;
             if offset < self.data.len() {
-                self.header.current_emission = 0;
+                self.header.current_emission = 1;
                 let chunk = self.get_chunk();
                 self.header.size = chunk.len().try_into().expect("Chunk size too big?!");
                 bincode::serialize_into(&mut self.buffer, &self.header)
