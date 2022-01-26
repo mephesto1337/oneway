@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use crate::messages::Message;
-use crate::envelope::{EnvelopeHeader, EnvelopeIterator};
-use crate::error::{Result, Error};
+use crate::{Result, Wire};
 use crate::config::Config;
+use crate::retransmit::Retransmit;
 
 use tokio::io::{AsyncWrite, AsyncWriteExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::time;
@@ -28,12 +28,12 @@ where
         Self { writer, config, keep_alive }
     }
 
-    async fn send_message(&mut self, message: Message) -> Result<()> {
-        let raw_message = bincode::serialize(&message)?;
-        let mut envelope_iter = EnvelopeIterator::new(&raw_message[..], &self.config)?;
-        while let Some(raw_enveloppe) = envelope_iter.get_next_envelope() {
-            self.writer.write_all(raw_enveloppe).await?;
-        }
+    async fn send_message(&mut self, message: &Message) -> Result<()> {
+        let mut raw_message = Vec::new();
+        message.to_wire(&mut raw_message)?;
+
+        let mut retransmit = Retransmit::new(&raw_message[..], self.config.remission_count, self.config.mtu)?;
+        retransmit.send(&mut self.writer).await?;
 
         Ok(())
     }
@@ -41,27 +41,44 @@ where
     pub async fn send_hello(&mut self) -> Result<()> {
         let message = Message::Hello;
 
-        self.send_message(message).await
+        self.send_message(&message).await
     }
 
     pub async fn send_keep_alive(&mut self) -> Result<()> {
         let message = Message::KeepAlive(self.keep_alive);
         self.keep_alive = self.keep_alive.wrapping_add(1);
 
-        self.send_message(message).await
+        self.send_message(&message).await
     }
 
     pub async fn send_files(&mut self, files: &[PathBuf]) -> Result<()> {
         let files_count = files.len().try_into()?;
 
-        self.send_message(Message::CountFilesToUpload(files_count)).await?;
+        self.send_message(&Message::CountFilesToUpload(files_count)).await?;
 
         for file in files {
-            let content = tokio::fs::read(file).await?;
+            let metadata = tokio::fs::symlink_metadata(file).await?;
             let filename = file.to_string_lossy().to_string();
-            let created = tokio::fs::symlink_metadata(file).await?.created()?.duration_since(std::time::UNIX_EPOCH)?.as_secs();
+            let created = metadata.created()?;
+            let size = metadata.len();
 
-            self.send_message(Message::File {filename, content, created}).await?;
+            // First sends the file existance
+            self.send_message(&Message::File {filename: filename.clone(), created, size}).await?;
+
+            // Now its content
+            let mut f = tokio::fs::File::open(file).await?;
+            let mut offset = 064;
+            let content = Vec::with_capacity(self.config.mtu - crate::retransmit::max_payload_size(self.config.mtu));
+            let mut message = Message::FileChunk { filename, offset, content };
+            let buffer = match message {
+                Message::FileChunk { ref mut content, .. } => content,
+                _ => unreachable!()
+            };
+            loop {
+                buffer.clear();
+                let size = f.read(buffer).await?;
+            }
+
         }
 
         Ok(())
@@ -85,84 +102,16 @@ where
         Self { reader: BufReader::new(reader), config }
     }
 
-    /// Returns:
-    ///   Ok(true) if the read was a success
-    ///   Ok(false) if a timeout occured
-    ///   Err(_) if trouble
-    async fn recv_exact(&mut self, buf: &mut [u8]) -> Result<bool> {
-        let sleep = time::sleep(self.config.recv_timeout.clone());
-        tokio::pin!(sleep);
-
-        tokio::select! {
-            _ = self.reader.read_exact(buf) => {
-                return Ok(true)
-            }
-            _ = &mut sleep => {
-                return Ok(false)
-            }
-        }
-
-    }
-
-    async fn recv_envelope(&mut self) -> Result<(EnvelopeHeader, Vec<u8>)> {
-        let envelope_header_size = EnvelopeHeader::size();
-        let mut envelopes = Vec::with_capacity(self.config.remission_count);
-        let mut envelope_buffer = Vec::with_capacity(envelope_header_size);
-
-        loop {
-            if !self.recv_exact(&mut envelope_buffer[..]).await? {
-                break;
-            }
-            let envelope: EnvelopeHeader = bincode::deserialize(&envelope_buffer[..])?;
-            let mut data = Vec::with_capacity(envelope.size as usize);
-            if !self.recv_exact(&mut data[..]).await? {
-                break;
-            }
-
-            let should_break = envelope.emission_count == envelope.current_emission;
-            envelopes.push((envelope, data));
-
-            if should_break {
-                break;
-            }
-        }
-
-        if let Some((envelope1, data1)) = envelopes.pop() {
-            for (_, data) in &envelopes {
-                if data != &data1 {
-                    log::warn!("Got different data for the same chunk");
-                    log::debug!("reference: {:x?}", data1);
-                    log::debug!("different: {:x?}", data);
-                }
-            }
-            Ok((envelope1, data1))
-        } else {
-            Err(Error::NoData)
-        }
-    }
-
     pub async fn recv_message(&mut self) -> Result<Message> {
-        let mut buffer = Vec::with_capacity(self.config.mtu);
+        let buffer = Retransmit::recv(&mut self.reader, self.config.recv_timeout.clone(), self.config.mtu).await?;
 
-        let (header, data) = self.recv_envelope().await?;
-        if header.offset != 0 {
-            return Err(Error::MissingData(buffer.len()..header.offset as usize));
+        let (rest, message) = Message::from_wire(&buffer[..])?;
+        if ! rest.is_empty() {
+            log::warn!("Got extra data from message: {:x?}", rest);
         }
-
-        buffer.write(&data[..]).await.expect("Memory write should never fail");
-        while (buffer.len() as u64) < header.total_size {
-            let (next_header, data) = self.recv_envelope().await?;
-            if next_header.offset as usize != buffer.len() {
-                return Err(Error::MissingData(buffer.len()..header.offset as usize));
-            }
-            buffer.write(&data[..]).await.expect("Memory write should never fail");
-        }
-
-        let message = bincode::deserialize(&buffer[..])?;
 
         Ok(message)
     }
-
 }
 
 
