@@ -152,6 +152,7 @@ impl<'d> Retransmit<'d> {
         if self.current_emission <= self.total_emissions {
             self.prepare_buffer();
             self.current_emission += 1;
+            log::trace!("Will send {:?}", &self.header);
             return Some(&self.buffer[..]);
         }
 
@@ -162,6 +163,7 @@ impl<'d> Retransmit<'d> {
             self.header.offset += advance;
 
             self.prepare_buffer();
+            log::trace!("Will send {:?}", &self.header);
             return Some(&self.buffer[..]);
         }
 
@@ -195,7 +197,8 @@ impl<'d> Retransmit<'d> {
         tokio::pin!(sleep);
 
         tokio::select! {
-            _ = reader.read_exact(buffer) => {
+            result = reader.read_exact(buffer) => {
+                let _ = result?;
                 Ok(())
             }
             _ = &mut sleep => {

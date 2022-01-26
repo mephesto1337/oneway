@@ -32,6 +32,9 @@ pub enum Error {
 
     /// Invalid UTF-8
     UTF8(std::str::Utf8Error),
+
+    /// Invalid address
+    Address(std::net::AddrParseError),
 }
 
 pub type Result<T> = ::std::result::Result<T, Error>;
@@ -93,6 +96,12 @@ impl From<std::str::Utf8Error> for Error {
     }
 }
 
+impl From<std::net::AddrParseError> for Error {
+    fn from(e: std::net::AddrParseError) -> Self {
+        Self::Address(e)
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -107,6 +116,7 @@ impl fmt::Display for Error {
             Self::NoData => write!(f, "No chunk was received"),
             Self::MissingData(ref r) => write!(f, "Missing data from {} to {}", r.start, r.end),
             Self::UTF8(ref e) => fmt::Display::fmt(e, f),
+            Self::Address(ref e) => fmt::Display::fmt(e, f),
         }
     }
 }

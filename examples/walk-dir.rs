@@ -1,5 +1,5 @@
-use oneway::error::Result;
 use oneway::tree::find_files;
+use oneway::Result;
 
 fn main() -> Result<()> {
     env_logger::init();

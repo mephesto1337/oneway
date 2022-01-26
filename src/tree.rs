@@ -103,7 +103,7 @@ pub fn find_files(
         let cwd = std::env::current_dir()?;
         cwd.join(root.as_ref()).canonicalize()?
     };
-    directories_to_visit.push_back(root);
+    directories_to_visit.push_back(root.clone());
 
     while let Some(dir) = directories_to_visit.pop_front() {
         let dir_entries =
@@ -167,7 +167,15 @@ pub fn find_files(
 
             if metadata.is_file() {
                 if filter(&current_entry) {
-                    entries.push(current_entry);
+                    if let Ok(relative_entry) = current_entry.strip_prefix(&root) {
+                        entries.push(relative_entry.to_path_buf());
+                    } else {
+                        log::warn!(
+                            "{} is not in {}, skipping",
+                            current_entry.display(),
+                            root.display()
+                        );
+                    }
                 }
                 continue 'next_entry;
             }

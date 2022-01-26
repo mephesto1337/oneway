@@ -1,14 +1,16 @@
 use std::io::{BufRead, BufReader, Read};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Config {
     pub remission_count: usize,
     pub mtu: usize,
     pub recv_timeout: Duration,
+    pub address: SocketAddr,
 
     #[cfg(feature = "encryption")]
     pub key: [u8; 32],
@@ -20,6 +22,7 @@ impl Default for Config {
             remission_count: 3,
             mtu: 1024,
             recv_timeout: Duration::from_secs(3),
+            address: "0.0.0.0:0".parse().unwrap(),
             #[cfg(feature = "encryption")]
             key: [0u8; 32],
         }
@@ -75,6 +78,8 @@ impl Config {
                         config.mtu = value.parse()?;
                     } else if key.eq_ignore_ascii_case("recv_timeout") {
                         config.recv_timeout = Duration::from_secs(value.parse()?);
+                    } else if key.eq_ignore_ascii_case("address") {
+                        config.address = value.parse()?;
                     } else if key.eq_ignore_ascii_case("key") {
                         todo!("parse key");
                     } else {

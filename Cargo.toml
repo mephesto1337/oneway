@@ -8,6 +8,12 @@ edition = "2021"
 [[example]]
 name = "walk-dir"
 
+[[example]]
+name = "sender"
+
+[[example]]
+name = "receiver"
+
 [features]
 default = []
 encryption = []
