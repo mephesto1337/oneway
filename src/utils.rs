@@ -85,5 +85,4 @@ mod windows {
         let value: MaybeUninit<T> = MaybeUninit::uninit();
         value
     }
-
 }

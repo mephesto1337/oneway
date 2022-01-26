@@ -169,6 +169,13 @@ impl Wire for Message {
                 total_size += size_of_val(&mk);
                 writer.write_all(&[mk])?;
 
+                let filename_len: u16 = filename.len().try_into()?;
+                total_size += size_of_val(&filename_len);
+                writer.write_all(&filename_len.to_be_bytes()[..])?;
+
+                total_size += filename.as_bytes().len();
+                writer.write_all(filename.as_bytes())?;
+
                 let offset = created.duration_since(UNIX_EPOCH)?.as_secs();
                 total_size += size_of_val(&offset);
                 writer.write_all(&offset.to_be_bytes()[..])?;

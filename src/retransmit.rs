@@ -1,10 +1,10 @@
-use std::io;
 use std::cmp::Ordering;
-use std::mem::size_of;
+use std::io;
 use std::marker::Unpin;
+use std::mem::size_of;
 use std::time::Duration;
 
-use crate::{Result, Error, Wire};
+use crate::{Error, Result, Wire};
 
 use nom::bytes::complete::tag;
 use nom::combinator::verify;
@@ -51,8 +51,10 @@ impl Wire for RetransmitHeader {
         let (rest, _magic) = context("RetransmitHeader/MAGIC", tag(RETRANSMIT_MAGIC))(input)?;
         let (rest, offset) = context("RetransmitHeader/offset", be_u16)(rest)?;
         let (rest, size) = context("RetransmitHeader/size", be_u16)(rest)?;
-        let (rest, total_size) =
-            context("RetransmitHeader/total_size", verify(be_u16, |&ts| ts >= offset + size))(rest)?;
+        let (rest, total_size) = context(
+            "RetransmitHeader/total_size",
+            verify(be_u16, |&ts| ts >= offset + size),
+        )(rest)?;
 
         Ok((
             rest,
@@ -184,7 +186,11 @@ impl<'d> Retransmit<'d> {
     }
 
     /// Small helper to receive data with a timeout
-    async fn recv_exact(reader: &mut (impl AsyncReadExt + Unpin), buffer: &mut [u8], timeout: Duration) -> Result<()> {
+    async fn recv_exact(
+        reader: &mut (impl AsyncReadExt + Unpin),
+        buffer: &mut [u8],
+        timeout: Duration,
+    ) -> Result<()> {
         let sleep = tokio::time::sleep(timeout);
         tokio::pin!(sleep);
 
@@ -199,7 +205,11 @@ impl<'d> Retransmit<'d> {
     }
 
     /// Received exactly one `RetransmitHeader` and its chunks if data
-    async fn recv_one_chunk(reader: &mut (impl AsyncReadExt + Unpin), timeout: Duration, chunk: &mut Vec<u8>) -> Result<RetransmitHeader> {
+    async fn recv_one_chunk(
+        reader: &mut (impl AsyncReadExt + Unpin),
+        timeout: Duration,
+        chunk: &mut Vec<u8>,
+    ) -> Result<RetransmitHeader> {
         let mut header_buf = [0u8; RetransmitHeader::size()];
         Self::recv_exact(reader, &mut header_buf[..], timeout.clone()).await?;
         let (_rest, header) = RetransmitHeader::from_wire(&header_buf[..])?;
@@ -212,8 +222,13 @@ impl<'d> Retransmit<'d> {
         Ok(header)
     }
 
-    /// Helper function to receive all retransmisted same chunks 
-    async fn recv_retransmits(reader: &mut (impl AsyncReadExt + Unpin), timeout: Duration, expected_offset: u16, chunk: &mut Vec<u8>) -> Result<RetransmitHeader> {
+    /// Helper function to receive all retransmisted same chunks
+    async fn recv_retransmits(
+        reader: &mut (impl AsyncReadExt + Unpin),
+        timeout: Duration,
+        expected_offset: u16,
+        chunk: &mut Vec<u8>,
+    ) -> Result<RetransmitHeader> {
         loop {
             let header = Self::recv_one_chunk(reader, timeout.clone(), chunk).await?;
             match header.offset.cmp(&expected_offset) {
@@ -236,13 +251,19 @@ impl<'d> Retransmit<'d> {
     }
 
     /// Receive a single buffer with retransmit logic being taken care of
-    pub async fn recv(mut reader: impl AsyncReadExt + Unpin, timeout: Duration, mtu: usize) -> Result<Vec<u8>> {
+    pub async fn recv(
+        mut reader: impl AsyncReadExt + Unpin,
+        timeout: Duration,
+        mtu: usize,
+    ) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         let mut expected_offset = 0;
         let mut chunk = Vec::with_capacity(mtu);
 
         loop {
-            let header = Self::recv_retransmits(&mut reader, timeout.clone(), expected_offset, &mut chunk).await?;
+            let header =
+                Self::recv_retransmits(&mut reader, timeout.clone(), expected_offset, &mut chunk)
+                    .await?;
             if data.len() != expected_offset as usize {
                 return Err(Error::MissingData(data.len()..expected_offset as usize));
             }
