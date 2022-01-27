@@ -1,21 +1,21 @@
-use std::cmp::Ordering;
+use std::cmp;
 use std::io;
 use std::mem::size_of;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::udp::{UdpReader, UdpWriter};
-use crate::{Error, Result, Wire};
+use crate::udp::UdpWriter;
+use crate::{Config, Error, Result, Wire};
 
 use nom::bytes::complete::tag;
 use nom::combinator::verify;
 use nom::error::context;
-use nom::number::complete::be_u16;
+use nom::number::complete::{be_u16, be_u32};
 
 /// Magic value "1WAY"
 const RETRANSMIT_MAGIC: &[u8; 4] = b"1WAY";
 
 /// The actual Retransmit header being set as a prefix for each data send/received
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RetransmitHeader {
     /// Offset in the current frame
     offset: u16,
@@ -25,6 +25,9 @@ struct RetransmitHeader {
 
     /// Total size of the data being transmitted
     total_size: u16,
+
+    /// Identifier of the request
+    id: u32,
 }
 
 impl RetransmitHeader {
@@ -33,8 +36,22 @@ impl RetransmitHeader {
         let offset_size = size_of::<u16>();
         let size_size = size_of::<u16>();
         let total_size_size = size_of::<u16>();
+        let id_size = size_of::<u32>();
 
-        magic_size + offset_size + size_size + total_size_size
+        magic_size + offset_size + size_size + total_size_size + id_size
+    }
+
+    fn get_next_id() -> u32 {
+        static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+        // static NEXT_ID_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+        // if !NEXT_ID_INITIALIZED.load(Ordering::Relaxed) {
+        //     let random_id = unsafe { crate::utils::get_random::<u32>().assume_init() };
+        //     NEXT_ID.store(random_id, Ordering::Relaxed);
+        //     NEXT_ID_INITIALIZED.store(true, Ordering::Relaxed);
+        // }
+
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -53,6 +70,7 @@ impl Wire for RetransmitHeader {
             "RetransmitHeader/total_size",
             verify(be_u16, |&ts| ts >= offset + size),
         )(rest)?;
+        let (rest, id) = context("RetransmitHeader/id", be_u32)(rest)?;
 
         Ok((
             rest,
@@ -60,6 +78,7 @@ impl Wire for RetransmitHeader {
                 offset,
                 size,
                 total_size,
+                id,
             },
         ))
     }
@@ -69,6 +88,7 @@ impl Wire for RetransmitHeader {
         writer.write_all(&self.offset.to_be_bytes()[..])?;
         writer.write_all(&self.size.to_be_bytes()[..])?;
         writer.write_all(&self.total_size.to_be_bytes()[..])?;
+        writer.write_all(&self.id.to_be_bytes()[..])?;
 
         Ok(Self::size())
     }
@@ -106,6 +126,7 @@ impl<'d> Retransmit<'d> {
             offset: 0,
             size: 0,
             total_size,
+            id: RetransmitHeader::get_next_id(),
         };
         let buffer = Vec::with_capacity(data.len() + RetransmitHeader::size());
 
@@ -150,7 +171,7 @@ impl<'d> Retransmit<'d> {
         if self.current_emission <= self.total_emissions {
             self.prepare_buffer();
             self.current_emission += 1;
-            log::trace!("Will send {:?}", &self.header);
+            tracing::trace!("Will send {:?}", &self.header);
             return Some(&self.buffer[..]);
         }
 
@@ -161,7 +182,7 @@ impl<'d> Retransmit<'d> {
             self.header.offset += advance;
 
             self.prepare_buffer();
-            log::trace!("Will send {:?}", &self.header);
+            tracing::trace!("Will send {:?}", &self.header);
             return Some(&self.buffer[..]);
         }
 
@@ -180,120 +201,163 @@ impl<'d> Retransmit<'d> {
         self.reset();
 
         while let Some(chunk) = self.get_next_chunk() {
-            log::debug!("Sending {} bytes chunk", chunk.len());
+            tracing::debug!("Sending {} bytes chunk", chunk.len());
             socket.send(chunk).await?;
         }
         Ok(())
     }
+}
 
-    /// Small helper to receive data with a timeout
-    async fn recv_with_timeout(
-        socket: &UdpReader,
-        buffer: &mut [u8],
-        timeout: Duration,
-    ) -> Result<usize> {
-        let sleep = tokio::time::sleep(timeout);
-        tokio::pin!(sleep);
+#[derive(Debug)]
+pub struct Reassembler {
+    /// Buffer for data being passed to this struct
+    buffer: Vec<u8>,
 
-        tokio::select! {
-            result = socket.recv(buffer) => {
-                let size = result?;
-                log::trace!("Received {} bytes", size);
-                Ok(size)
-            }
-            _ = &mut sleep => {
-                log::trace!("Timeout occured");
-                Err(Error::NoData)
-            }
+    /// Read offset into the buffer
+    offset: usize,
+
+    /// Preload header
+    current_header: Option<RetransmitHeader>,
+
+    /// Expected next identifier
+    expected_id: Option<u32>,
+}
+
+impl Reassembler {
+    pub fn new(config: &Config) -> Self {
+        Self {
+            buffer: Vec::with_capacity(config.mtu * 2),
+            offset: 0,
+            current_header: None,
+            expected_id: None,
         }
     }
 
-    /// Received exactly one `RetransmitHeader` and its chunks if data
-    async fn recv_one_chunk<'c>(
-        socket: &UdpReader,
-        timeout: Duration,
-        chunk: &'c mut Vec<u8>,
-    ) -> Result<RetransmitHeader> {
-        let size = Self::recv_with_timeout(socket, &mut chunk[..], timeout).await?;
-        let (data, header) = RetransmitHeader::from_wire(&chunk[..size])?;
+    fn get_data(&self) -> &[u8] {
+        &self.buffer[self.offset..]
+    }
 
-        match data.len().cmp(&(header.size as usize)) {
-            Ordering::Less => {
-                let missing = data.len() - header.size as usize;
-                log::warn!("Missing {} bytes in chunk", missing);
+    fn consume(&mut self, count: usize) {
+        assert!(self.offset + count <= self.buffer.len());
+        self.offset += count;
+        self.current_header = None;
+
+        if self.buffer.len() > 4096 {
+            tracing::trace!(
+                "Buffer is too large ({} bytes), shrinking it",
+                self.buffer.len()
+            );
+            let mut new_buffer = self.buffer.split_off(self.offset);
+            std::mem::swap(&mut new_buffer, &mut self.buffer);
+        }
+    }
+
+    pub fn push_data(&mut self, data: &[u8]) {
+        self.buffer.extend_from_slice(data);
+        tracing::trace!("Adding {} bytes to buffer", data.len());
+    }
+
+    /// If `self.current_header`, parses content in self.buffer to load
+    fn load_header(&mut self) -> Result<&RetransmitHeader> {
+        if self.current_header.is_none() {
+            if self.get_data().len() < RetransmitHeader::size() {
+                return Err(Error::NoData);
             }
-            Ordering::Equal => {}
-            Ordering::Greater => {
-                let extra = header.size as usize - data.len();
-                log::warn!("Got {} extra bytes in chunk", extra);
+            let (_rest, header) = RetransmitHeader::from_wire(self.get_data())?;
+            if self.expected_id.is_none() {
+                self.expected_id = Some(header.id);
+            }
+            tracing::trace!("Consume new RetransmitHeader");
+            self.consume(RetransmitHeader::size());
+            self.current_header = Some(header);
+        }
+
+        self.current_header.as_ref().ok_or_else(|| Error::NoData)
+    }
+
+    fn get_restransmits(
+        &mut self,
+        data: &mut Vec<u8>,
+        expected_offset: u16,
+    ) -> Result<RetransmitHeader> {
+        self.load_header()?;
+        let mut expected_id = *self.expected_id.as_ref().unwrap();
+
+        loop {
+            let current_header = self.load_header()?.clone();
+            tracing::debug!(
+                "current_header = {:?}, expected_id={}, expected_offset={}",
+                current_header,
+                expected_id,
+                expected_offset
+            );
+
+            match current_header.id.cmp(&expected_id) {
+                cmp::Ordering::Less => {
+                    tracing::trace!("Got previous session, skipping");
+                    self.consume(current_header.size as usize);
+                    continue;
+                }
+                cmp::Ordering::Greater => {
+                    tracing::warn!(
+                        "Got a future session?! expected_id={} / received={}",
+                        expected_id,
+                        current_header.id
+                    );
+                    expected_id = current_header.id;
+                    self.expected_id = Some(expected_id);
+                }
+                cmp::Ordering::Equal => {}
+            }
+
+            match current_header.offset.cmp(&expected_offset) {
+                cmp::Ordering::Less => {
+                    tracing::trace!("Got already seen offset, skipping");
+                    self.consume(current_header.size as usize);
+                    continue;
+                }
+                cmp::Ordering::Greater => {
+                    tracing::warn!("Missed chunk of data");
+                    let start = expected_offset as usize;
+                    let end = current_header.offset as usize;
+                    return Err(Error::MissingData(start..end));
+                }
+                cmp::Ordering::Equal => {
+                    break;
+                }
             }
         }
+
+        let header = self.current_header.take().unwrap();
+        tracing::debug!("Consuming this header \\o/ ! {:?}", &header);
+        let data_size = header.size as usize;
+        let header_data = &self.get_data()[..data_size];
+        data.extend_from_slice(header_data);
+        tracing::trace!("Consuming buffer data: {:?} / {:x?}", &header, header_data);
+        self.consume(data_size);
 
         Ok(header)
     }
 
-    /// Helper function to receive all retransmisted same chunks
-    async fn recv_retransmits<'c>(
-        socket: &UdpReader,
-        timeout: Duration,
-        expected_offset: u16,
-        chunk: &'c mut Vec<u8>,
-    ) -> Result<(RetransmitHeader, &'c [u8])> {
-        loop {
-            let header = Self::recv_one_chunk(socket, timeout.clone(), chunk).await?;
-            log::debug!(
-                "[DEBUG] header.offset = {}, expected_offset = {}",
-                header.offset,
-                expected_offset
-            );
-            match header.offset.cmp(&expected_offset) {
-                Ordering::Less => {
-                    // Previous chunk, just ignore it
-                    continue;
-                }
-                Ordering::Greater => {
-                    // We missed all previous data
-                    let start_missing = expected_offset as usize;
-                    let end_missing = header.offset as usize;
-                    return Err(Error::MissingData(start_missing..end_missing));
-                }
-                Ordering::Equal => {
-                    // We got our chunk, let's break
-                    let size = header.size as usize;
-                    let data = &chunk[RetransmitHeader::size()..][..size];
-                    return Ok((header, data));
-                }
-            }
-        }
-    }
-
-    /// Receive a single buffer with retransmit logic being taken care of
-    pub async fn recv(socket: &UdpReader, timeout: Duration, mtu: usize) -> Result<Vec<u8>> {
+    /// Reassemble and returns next data
+    pub fn get_next_data(&mut self) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         let mut expected_offset = 0;
-        let mut chunk = Vec::with_capacity(mtu);
-        chunk.resize(mtu, 0);
 
         loop {
-            let (header, chunk_data) =
-                Self::recv_retransmits(socket, timeout.clone(), expected_offset, &mut chunk)
-                    .await?;
-            if data.len() != expected_offset as usize {
-                log::debug!(
-                    "data.len() = {}, expected_offset = {}",
-                    data.len(),
-                    expected_offset
-                );
-                return Err(Error::MissingData(data.len()..expected_offset as usize));
-            }
-            assert_eq!(chunk_data.len(), header.size as usize);
-            data.extend_from_slice(&chunk_data[..]);
-            expected_offset += header.size;
-
-            if expected_offset >= header.total_size {
+            eprintln!("[BEFORE] expected_offset = {}", expected_offset);
+            let header = self.get_restransmits(&mut data, expected_offset)?;
+            eprintln!("[AFTER1] expected_offset = {}", expected_offset);
+            expected_offset += dbg!(header.size);
+            eprintln!("[AFTER2] expected_offset = {}", expected_offset);
+            if dbg!(expected_offset) == dbg!(header.total_size) {
                 break;
             }
         }
+
+        // We just want to increment the `RetransmitHeader::id`
+        *self.expected_id.as_mut().unwrap() += 1;
+        tracing::debug!("Got complete message");
 
         Ok(data)
     }

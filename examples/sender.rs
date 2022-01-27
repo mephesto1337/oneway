@@ -15,8 +15,6 @@ async fn main() -> Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect(&config.address).await?;
 
-    let buf = [0u8; 1];
-    socket.send(&buf[..]).await?;
     log::info!("Connected to {}", config.address);
 
     let mut client = Client::new_with_config(UdpWriter::new(socket)?, config);

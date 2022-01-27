@@ -89,9 +89,8 @@ impl Client {
             offset: 0,
             content,
         };
-        let mut done_reading = false;
 
-        while !done_reading {
+        loop {
             match message {
                 Message::FileChunk {
                     ref mut offset,
@@ -103,8 +102,8 @@ impl Client {
                     let size = f.read(&mut content[..]).await?;
                     content.truncate(size);
                     if size == 0 {
-                        done_reading = true;
                         log::info!("File {} sent to server ({} bytes)", filename, *offset);
+                        break;
                     }
                 }
                 _ => unreachable!(),
