@@ -9,6 +9,7 @@ use tokio::net::UdpSocket;
 async fn main() -> Result<()> {
     env_logger::init();
     let config = Config::from_file("client.conf")?;
+    log::info!("config ={:?}", config);
 
     let config = config.clone();
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -23,6 +24,7 @@ async fn main() -> Result<()> {
 
     client.send_hello().await?;
     client.send_files(&files[..]).await?;
+    client.send_done().await?;
 
     Ok(())
 }

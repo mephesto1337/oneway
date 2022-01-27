@@ -1,17 +1,15 @@
 use std::cmp::Ordering;
 use std::io;
-use std::marker::Unpin;
 use std::mem::size_of;
 use std::time::Duration;
 
+use crate::udp::{UdpReader, UdpWriter};
 use crate::{Error, Result, Wire};
 
 use nom::bytes::complete::tag;
 use nom::combinator::verify;
 use nom::error::context;
 use nom::number::complete::be_u16;
-
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Magic value "1WAY"
 const RETRANSMIT_MAGIC: &[u8; 4] = b"1WAY";
@@ -156,10 +154,10 @@ impl<'d> Retransmit<'d> {
             return Some(&self.buffer[..]);
         }
 
+        let advance: u16 = (self.mtu - RetransmitHeader::size()).try_into().unwrap();
         // If we cannot advance current_emission, then increase offset
-        if self.header.offset < self.header.total_size {
+        if self.header.offset + advance < self.header.total_size {
             self.current_emission = 1;
-            let advance: u16 = (self.mtu - RetransmitHeader::size()).try_into().unwrap();
             self.header.offset += advance;
 
             self.prepare_buffer();
@@ -178,62 +176,76 @@ impl<'d> Retransmit<'d> {
     }
 
     /// Sends current request with repetitions
-    pub async fn send(&mut self, mut writer: impl AsyncWriteExt + Unpin) -> Result<()> {
+    pub async fn send(&mut self, socket: &UdpWriter) -> Result<()> {
         self.reset();
 
         while let Some(chunk) = self.get_next_chunk() {
-            writer.write_all(chunk).await?;
+            log::debug!("Sending {} bytes chunk", chunk.len());
+            socket.send(chunk).await?;
         }
         Ok(())
     }
 
     /// Small helper to receive data with a timeout
-    async fn recv_exact(
-        reader: &mut (impl AsyncReadExt + Unpin),
+    async fn recv_with_timeout(
+        socket: &UdpReader,
         buffer: &mut [u8],
         timeout: Duration,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let sleep = tokio::time::sleep(timeout);
         tokio::pin!(sleep);
 
         tokio::select! {
-            result = reader.read_exact(buffer) => {
-                let _ = result?;
-                Ok(())
+            result = socket.recv(buffer) => {
+                let size = result?;
+                log::trace!("Received {} bytes", size);
+                Ok(size)
             }
             _ = &mut sleep => {
+                log::trace!("Timeout occured");
                 Err(Error::NoData)
             }
         }
     }
 
     /// Received exactly one `RetransmitHeader` and its chunks if data
-    async fn recv_one_chunk(
-        reader: &mut (impl AsyncReadExt + Unpin),
+    async fn recv_one_chunk<'c>(
+        socket: &UdpReader,
         timeout: Duration,
-        chunk: &mut Vec<u8>,
+        chunk: &'c mut Vec<u8>,
     ) -> Result<RetransmitHeader> {
-        let mut header_buf = [0u8; RetransmitHeader::size()];
-        Self::recv_exact(reader, &mut header_buf[..], timeout.clone()).await?;
-        let (_rest, header) = RetransmitHeader::from_wire(&header_buf[..])?;
+        let size = Self::recv_with_timeout(socket, &mut chunk[..], timeout).await?;
+        let (data, header) = RetransmitHeader::from_wire(&chunk[..size])?;
 
-        // Always reads the chunlk associated with the header
-        let size = header.size as usize;
-        chunk.resize(size, 0);
-        Self::recv_exact(reader, &mut chunk[..], timeout).await?;
+        match data.len().cmp(&(header.size as usize)) {
+            Ordering::Less => {
+                let missing = data.len() - header.size as usize;
+                log::warn!("Missing {} bytes in chunk", missing);
+            }
+            Ordering::Equal => {}
+            Ordering::Greater => {
+                let extra = header.size as usize - data.len();
+                log::warn!("Got {} extra bytes in chunk", extra);
+            }
+        }
 
         Ok(header)
     }
 
     /// Helper function to receive all retransmisted same chunks
-    async fn recv_retransmits(
-        reader: &mut (impl AsyncReadExt + Unpin),
+    async fn recv_retransmits<'c>(
+        socket: &UdpReader,
         timeout: Duration,
         expected_offset: u16,
-        chunk: &mut Vec<u8>,
-    ) -> Result<RetransmitHeader> {
+        chunk: &'c mut Vec<u8>,
+    ) -> Result<(RetransmitHeader, &'c [u8])> {
         loop {
-            let header = Self::recv_one_chunk(reader, timeout.clone(), chunk).await?;
+            let header = Self::recv_one_chunk(socket, timeout.clone(), chunk).await?;
+            log::debug!(
+                "[DEBUG] header.offset = {}, expected_offset = {}",
+                header.offset,
+                expected_offset
+            );
             match header.offset.cmp(&expected_offset) {
                 Ordering::Less => {
                     // Previous chunk, just ignore it
@@ -247,31 +259,35 @@ impl<'d> Retransmit<'d> {
                 }
                 Ordering::Equal => {
                     // We got our chunk, let's break
-                    return Ok(header);
+                    let size = header.size as usize;
+                    let data = &chunk[RetransmitHeader::size()..][..size];
+                    return Ok((header, data));
                 }
             }
         }
     }
 
     /// Receive a single buffer with retransmit logic being taken care of
-    pub async fn recv(
-        mut reader: impl AsyncReadExt + Unpin,
-        timeout: Duration,
-        mtu: usize,
-    ) -> Result<Vec<u8>> {
+    pub async fn recv(socket: &UdpReader, timeout: Duration, mtu: usize) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         let mut expected_offset = 0;
         let mut chunk = Vec::with_capacity(mtu);
+        chunk.resize(mtu, 0);
 
         loop {
-            let header =
-                Self::recv_retransmits(&mut reader, timeout.clone(), expected_offset, &mut chunk)
+            let (header, chunk_data) =
+                Self::recv_retransmits(socket, timeout.clone(), expected_offset, &mut chunk)
                     .await?;
             if data.len() != expected_offset as usize {
+                log::debug!(
+                    "data.len() = {}, expected_offset = {}",
+                    data.len(),
+                    expected_offset
+                );
                 return Err(Error::MissingData(data.len()..expected_offset as usize));
             }
-            assert_eq!(chunk.len(), header.size as usize);
-            data.extend_from_slice(&chunk[..]);
+            assert_eq!(chunk_data.len(), header.size as usize);
+            data.extend_from_slice(&chunk_data[..]);
             expected_offset += header.size;
 
             if expected_offset >= header.total_size {

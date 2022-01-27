@@ -10,10 +10,13 @@ use tokio::net::UdpSocket;
 pub struct UdpReader(UdpSocket);
 
 impl UdpReader {
+    /// The socket *must* be connected
     pub fn new(s: UdpSocket) -> io::Result<Self> {
+        log::trace!("UdpReader::new");
         use crate::utils::Shutdown;
 
         crate::utils::shutdown(&s, Shutdown::Write)?;
+        log::debug!("Socket made read-only");
         Ok(Self(s))
     }
 }
@@ -45,6 +48,11 @@ impl AsyncRead for UdpReader {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         self.0.poll_recv(cx, buf)
+        // match self.0.poll_recv_from(cx, buf) {
+        //     Poll::Pending => Poll::Pending,
+        //     Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
+        //     Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+        // }
     }
 }
 
@@ -52,6 +60,7 @@ impl AsyncRead for UdpReader {
 pub struct UdpWriter(UdpSocket);
 
 impl UdpWriter {
+    /// The socket *must* be connected
     pub fn new(s: UdpSocket) -> io::Result<Self> {
         use crate::utils::Shutdown;
 

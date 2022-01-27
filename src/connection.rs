@@ -6,30 +6,28 @@ use std::time::SystemTime;
 use crate::config::Config;
 use crate::messages::Message;
 use crate::retransmit::Retransmit;
+use crate::udp::{UdpReader, UdpWriter};
 use crate::{Error, Result, Wire};
 
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-pub struct Client<W> {
-    writer: W,
+pub struct Client {
+    socket: UdpWriter,
     config: Config,
     keep_alive: u64,
 }
 
-impl<W> Client<W>
-where
-    W: AsyncWrite + std::marker::Unpin,
-{
-    pub fn new(writer: W) -> Self {
-        Self::new_with_config(writer, Config::default())
+impl Client {
+    pub fn new(socket: UdpWriter) -> Self {
+        Self::new_with_config(socket, Config::default())
     }
 
-    pub fn new_with_config(writer: W, config: Config) -> Self {
+    pub fn new_with_config(socket: UdpWriter, config: Config) -> Self {
         // SAFETY: any memory representation of a u64 is a valid one
         let keep_alive = unsafe { crate::utils::get_random().assume_init() };
         Self {
-            writer,
+            socket,
             config,
             keep_alive,
         }
@@ -37,6 +35,7 @@ where
 
     async fn send_message(&mut self, message: &Message) -> Result<()> {
         let mut raw_message = Vec::new();
+        log::debug!("Sending message: {:?}", message);
         message.to_wire(&mut raw_message)?;
 
         let mut retransmit = Retransmit::new(
@@ -44,7 +43,7 @@ where
             self.config.remission_count,
             self.config.mtu,
         )?;
-        retransmit.send(&mut self.writer).await?;
+        retransmit.send(&self.socket).await?;
 
         Ok(())
     }
@@ -84,9 +83,8 @@ where
 
         // Now its content
         let mut f = tokio::fs::File::open(file).await?;
-        let content = Vec::with_capacity(
-            self.config.mtu - crate::retransmit::max_payload_size(self.config.mtu),
-        );
+        let content_size = crate::retransmit::max_payload_size(self.config.mtu);
+        let content = vec![0u8; content_size];
         let mut message = Message::FileChunk {
             filename,
             offset: 0,
@@ -101,9 +99,10 @@ where
                     ref mut content,
                     ref filename,
                 } => {
-                    content.clear();
                     *offset = f.stream_position().await?;
-                    let size = f.read(content).await?;
+                    content.resize(content_size, 0);
+                    let size = f.read(&mut content[..]).await?;
+                    content.truncate(size);
                     if size == 0 {
                         done_reading = true;
                         log::info!("File {} sent to server ({} bytes)", filename, *offset);
@@ -111,6 +110,7 @@ where
                 }
                 _ => unreachable!(),
             }
+            self.send_message(&message).await?;
         }
 
         Ok(())
@@ -128,28 +128,38 @@ where
 
         Ok(())
     }
+
+    pub async fn send_done(&mut self) -> Result<()> {
+        let message = Message::Done;
+
+        self.send_message(&message).await?;
+        log::info!("Send Done to server");
+        Ok(())
+    }
 }
 
-pub struct Server<R> {
-    reader: BufReader<R>,
+pub struct Server {
+    socket: UdpReader,
     config: Config,
     keep_alive: Option<u64>,
     client_addr: SocketAddr,
     root: PathBuf,
 }
 
-impl<R> Server<R>
-where
-    R: AsyncRead + std::marker::Unpin + Send + Sync,
-{
-    pub fn new_with_config(reader: R, config: Config, client_addr: SocketAddr) -> Self {
+impl Server {
+    pub fn new_with_config(socket: UdpReader, config: Config, client_addr: SocketAddr) -> Self {
+        log::trace!("Server::new_with_config");
         Self {
-            reader: BufReader::new(reader),
+            socket,
             config,
             keep_alive: None,
             client_addr,
             root: std::env::current_dir().expect("Cannot get current directory"),
         }
+    }
+
+    pub fn client_addr(&self) -> &SocketAddr {
+        &self.client_addr
     }
 
     pub fn set_root(&mut self, root: impl AsRef<Path>) {
@@ -158,7 +168,7 @@ where
 
     pub async fn recv_message(&mut self) -> Result<Message> {
         let buffer = Retransmit::recv(
-            &mut self.reader,
+            &self.socket,
             self.config.recv_timeout.clone(),
             self.config.mtu,
         )
@@ -206,7 +216,26 @@ where
     }
 
     async fn process_message_file(&self, filename: String, _created: SystemTime, size: u64) {
+        async fn create_directories(filename: &PathBuf) -> Result<()> {
+            let parent = filename.parent().unwrap();
+            match tokio::fs::symlink_metadata(parent).await {
+                Ok(metadata) => {
+                    assert!(metadata.is_dir());
+                    Ok(())
+                }
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        tokio::fs::create_dir_all(parent).await?;
+                        Ok(())
+                    } else {
+                        Err(e.into())
+                    }
+                }
+            }
+        }
+
         async fn create_file(filename: &PathBuf, size: u64) -> Result<()> {
+            create_directories(filename).await?;
             let f = File::create(filename).await?;
             f.set_len(size).await?;
 
@@ -252,17 +281,21 @@ where
             return;
         }
 
-        tokio::spawn(async move {
-            if let Err(e) = write_chunk_to_file(&real_filename, offset, content).await {
-                log::error!(
-                    "[{}] Could not write chunk at offset 0x{:x} to {:?}: {}",
-                    client_addr,
-                    offset,
-                    real_filename.display(),
-                    e
-                );
-            }
-        });
+        //tokio::spawn(async move {
+        if let Err(e) = write_chunk_to_file(&real_filename, offset, content).await {
+            log::error!(
+                "[{}] Could not write chunk at offset 0x{:x} to {:?}: {}",
+                client_addr,
+                offset,
+                real_filename.display(),
+                e
+            );
+        }
+        //});
+    }
+
+    async fn process_message_done(&mut self) {
+        log::info!("[{}] Received done from client", self.client_addr);
     }
 
     pub async fn process_message(&mut self, message: Message) {
@@ -285,6 +318,21 @@ where
                 self.process_message_file_chunk(filename, offset, content)
                     .await
             }
+            Message::Done => self.process_message_done().await,
         }
+    }
+
+    pub async fn serve_forever(&mut self) -> Result<()> {
+        loop {
+            log::trace!("Waiting for a message");
+            let message = self.recv_message().await?;
+            log::debug!("Received message: {:?}", message);
+            if matches!(message, Message::Done) {
+                break;
+            } else {
+                self.process_message(message).await;
+            }
+        }
+        Ok(())
     }
 }

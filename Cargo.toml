@@ -25,6 +25,9 @@ env_logger = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "time", "fs", "net", "macros"] }
 log = "0.4"
 nom = "7"
+tracing = { version = "0.1", features = ["std", "log", "log-always"] }
+tracing-log = { version = "0.1", features = ["env_logger", "log-tracer"] }
+
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

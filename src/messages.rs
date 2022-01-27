@@ -34,6 +34,9 @@ pub enum Message {
         offset: u64,
         content: Vec<u8>,
     },
+
+    /// Client is done
+    Done,
 }
 
 #[repr(u8)]
@@ -44,6 +47,7 @@ enum MessageKind {
     CountFilesToUpload,
     File,
     FileChunk,
+    Done,
 }
 
 impl MessageKind {
@@ -54,6 +58,7 @@ impl MessageKind {
             2 => Some(Self::CountFilesToUpload),
             3 => Some(Self::File),
             4 => Some(Self::FileChunk),
+            5 => Some(Self::Done),
             _ => None,
         }
     }
@@ -131,6 +136,7 @@ impl Wire for Message {
                     },
                 ))
             }
+            MessageKind::Done => Ok((rest, Self::Done)),
         }
     }
 
@@ -188,7 +194,7 @@ impl Wire for Message {
                 ref offset,
                 ref content,
             } => {
-                let mk = MessageKind::File.to_u8();
+                let mk = MessageKind::FileChunk.to_u8();
                 total_size += size_of_val(&mk);
                 writer.write_all(&[mk])?;
 
@@ -208,6 +214,11 @@ impl Wire for Message {
 
                 total_size += content.len();
                 writer.write_all(&content[..])?;
+            }
+            Self::Done => {
+                let mk = MessageKind::Done.to_u8();
+                total_size += size_of_val(&mk);
+                writer.write_all(&[mk])?;
             }
         }
 
