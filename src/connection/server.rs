@@ -194,7 +194,7 @@ impl ClientHandler {
                     e
                 );
             } else {
-                tracing::info!(
+                tracing::debug!(
                     "[{}] Write {} bytes into {} at {}",
                     client_addr,
                     content_size,

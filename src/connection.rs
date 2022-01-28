@@ -34,8 +34,13 @@ impl Client {
 
     async fn send_message(&mut self, message: &Message) -> Result<()> {
         let mut raw_message = Vec::new();
-        log::debug!("Sending message: {:?}", message);
+        tracing::debug!("Sending message: {:?}", message);
         message.to_wire(&mut raw_message)?;
+        tracing::debug!(
+            "data to transmit: {} bytes (mtu {})",
+            raw_message.len(),
+            self.config.mtu
+        );
 
         let mut retransmit = Retransmit::new(
             &raw_message[..],
@@ -51,7 +56,7 @@ impl Client {
         let message = Message::Hello;
 
         self.send_message(&message).await?;
-        log::info!("Send Hello to server");
+        tracing::info!("Send Hello to server");
         Ok(())
     }
 
@@ -61,7 +66,7 @@ impl Client {
         self.keep_alive = self.keep_alive.wrapping_add(1);
 
         self.send_message(&message).await?;
-        log::debug!("Send keep alive ({}) to server", keep_alive);
+        tracing::debug!("Send keep alive ({}) to server", keep_alive);
         Ok(())
     }
 
@@ -78,17 +83,20 @@ impl Client {
             size,
         })
         .await?;
-        log::debug!("Notify server of file {}", filename);
+        tracing::debug!("Notify server of file {}", filename);
 
         // Now its content
         let mut f = tokio::fs::File::open(file).await?;
-        let content_size = crate::retransmit::max_payload_size(self.config.mtu);
-        let content = vec![0u8; content_size];
+        let content = vec![0u8; self.config.mtu];
         let mut message = Message::FileChunk {
             filename,
             offset: 0,
             content,
         };
+        // Avoid fragmentation and reassemble on the other size
+        let content_size = message
+            .get_max_content_size(crate::retransmit::max_payload_size(self.config.mtu))
+            .unwrap();
 
         loop {
             match message {
@@ -102,7 +110,7 @@ impl Client {
                     let size = f.read(&mut content[..]).await?;
                     content.truncate(size);
                     if size == 0 {
-                        log::info!("File {} sent to server ({} bytes)", filename, *offset);
+                        tracing::info!("File {} sent to server ({} bytes)", filename, *offset);
                         break;
                     }
                 }
@@ -131,7 +139,7 @@ impl Client {
         let message = Message::Done;
 
         self.send_message(&message).await?;
-        log::info!("Send Done to server");
+        tracing::info!("Send Done to server");
         Ok(())
     }
 }

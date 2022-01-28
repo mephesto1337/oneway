@@ -1,5 +1,5 @@
 use crate::{Result, Wire};
-use std::mem::size_of_val;
+use std::mem::{size_of, size_of_val};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nom::bytes::streaming::take;
@@ -37,6 +37,22 @@ pub enum Message {
 
     /// Client is done
     Done,
+}
+
+impl Message {
+    pub fn get_max_content_size(&self, mtu: usize) -> Option<usize> {
+        match self {
+            Self::FileChunk { ref filename, .. } => {
+                let mut prefix_size = size_of::<u8>(); // MesageKind
+                prefix_size += size_of::<u16>(); // Filename len
+                prefix_size += filename.len(); // filename
+                prefix_size += size_of::<u64>(); // offset
+                prefix_size += size_of::<u16>(); // content len
+                Some(mtu - prefix_size)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[repr(u8)]
@@ -111,20 +127,20 @@ impl Wire for Message {
                 ))
             }
             MessageKind::FileChunk => {
-                let (rest, filename_len) = context("Message/File/filename_len", be_u16)(rest)?;
+                let (rest, filename_len) = context("Message/FileChunk/filename_len", be_u16)(rest)?;
                 let (rest, filename) = context(
-                    "Message/File/filename",
+                    "Message/FileChunk/filename",
                     map(
                         map_res(take(filename_len), std::str::from_utf8),
                         String::from,
                     ),
                 )(rest)?;
 
-                let (rest, offset) = context("Message/File/size", be_u64)(rest)?;
+                let (rest, offset) = context("Message/FileChunk/offeet", be_u64)(rest)?;
 
-                let (rest, content_len) = context("Message/File/content_len", be_u64)(rest)?;
+                let (rest, content_len) = context("Message/FileChunk/content_len", be_u16)(rest)?;
                 let (rest, content) = context(
-                    "Message/File/content",
+                    "Message/FileChunk/content",
                     map(take(content_len), |slice: &[u8]| slice.to_vec()),
                 )(rest)?;
                 Ok((
@@ -208,7 +224,7 @@ impl Wire for Message {
                 total_size += size_of_val(offset);
                 writer.write_all(&offset.to_be_bytes()[..])?;
 
-                let content_len: u64 = content.len().try_into()?;
+                let content_len: u16 = content.len().try_into()?;
                 total_size += size_of_val(&content_len);
                 writer.write_all(&content_len.to_be_bytes()[..])?;
 

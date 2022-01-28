@@ -35,6 +35,9 @@ pub enum Error {
 
     /// Invalid address
     Address(std::net::AddrParseError),
+
+    /// Payload exceed maximum MTU
+    PayloadTooLarge(usize),
 }
 
 pub type Result<T> = ::std::result::Result<T, Error>;
@@ -117,6 +120,7 @@ impl fmt::Display for Error {
             Self::MissingData(ref r) => write!(f, "Missing data from {} to {}", r.start, r.end),
             Self::UTF8(ref e) => fmt::Display::fmt(e, f),
             Self::Address(ref e) => fmt::Display::fmt(e, f),
+            Self::PayloadTooLarge(size) => write!(f, "Payload exceed maximum MTU: {} bytes", size),
         }
     }
 }
