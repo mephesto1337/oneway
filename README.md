@@ -28,4 +28,7 @@ address = 127.0.0.1:12345
 
 ; Root directory to search for files for the client or where to store files for the server
 root = data/
+
+; Number of time to send a chunk of data
+remission_count = 3
 ```

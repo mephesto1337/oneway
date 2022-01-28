@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Read};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -11,7 +11,7 @@ pub struct Config {
     pub mtu: usize,
     pub recv_timeout: Duration,
     pub address: SocketAddr,
-    pub root: String,
+    pub root: PathBuf,
 
     #[cfg(feature = "encryption")]
     pub key: [u8; 32],
@@ -24,6 +24,8 @@ impl Default for Config {
             mtu: 1024,
             recv_timeout: Duration::from_secs(3),
             address: "0.0.0.0:0".parse().unwrap(),
+            root: std::env::current_dir().expect("Cannot get CWD"),
+
             #[cfg(feature = "encryption")]
             key: [0u8; 32],
         }
@@ -82,7 +84,7 @@ impl Config {
                     } else if key.eq_ignore_ascii_case("address") {
                         config.address = value.parse()?;
                     } else if key.eq_ignore_ascii_case("root") {
-                        config.root = value.to_owned();
+                        config.root = PathBuf::from(value);
                     } else if key.eq_ignore_ascii_case("key") {
                         todo!("parse key");
                     } else {
