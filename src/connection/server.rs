@@ -1,7 +1,7 @@
 use std::collections::{hash_map::Entry, HashMap};
 use std::io::SeekFrom;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::config::Config;
@@ -23,16 +23,20 @@ pub struct Server {
 impl Server {
     pub fn new_with_config(socket: UdpReader, config: Config) -> Self {
         tracing::trace!("Server::new_with_config");
+        let config_root = PathBuf::from(config.root);
+        let root = if config_root.is_absolute() {
+            config_root
+        } else {
+            let cwd = std::env::current_dir().expect("Cannot get current directory");
+            cwd.join(config_root)
+        };
+
         Self {
             socket,
             config,
-            root: std::env::current_dir().expect("Cannot get current directory"),
+            root,
             handlers: HashMap::new(),
         }
-    }
-
-    pub fn set_root(&mut self, root: impl AsRef<Path>) {
-        self.root = root.as_ref().to_path_buf();
     }
 
     pub async fn recv_message(&mut self) -> Result<()> {

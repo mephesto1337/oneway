@@ -1,3 +1,5 @@
+use std::env;
+
 use oneway::connection::Client;
 use oneway::tree::find_files;
 use oneway::udp::UdpWriter;
@@ -8,7 +10,14 @@ use tokio::net::UdpSocket;
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
-    let config = Config::from_file("client.conf")?;
+
+    let mut args = env::args();
+    let progname = args.next().unwrap();
+    let config_path = args
+        .next()
+        .expect(format!("Usage: {} CONFIG_FILE", progname));
+
+    let config = Config::from_file(config_path)?;
     log::info!("config ={:?}", config);
 
     let config = config.clone();
@@ -18,7 +27,7 @@ async fn main() -> Result<()> {
     log::info!("Connected to {}", config.address);
 
     let mut client = Client::new_with_config(UdpWriter::new(socket)?, config);
-    let files = find_files(".", false, |_| true)?;
+    let files = find_files(&config.root, false, |_| true)?;
 
     client.send_hello().await?;
     client.send_files(&files[..]).await?;
