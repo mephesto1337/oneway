@@ -1,7 +1,7 @@
 use std::cmp;
 use std::io;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::udp::UdpWriter;
 use crate::{Config, Error, Result, Wire};
@@ -221,6 +221,9 @@ pub struct Reassembler {
 
     /// Expected next identifier
     expected_id: Option<u32>,
+
+    /// Expected offset
+    expected_offset: u16,
 }
 
 impl Reassembler {
@@ -230,6 +233,7 @@ impl Reassembler {
             offset: 0,
             current_header: None,
             expected_id: None,
+            expected_offset: 0,
         }
     }
 
@@ -238,23 +242,24 @@ impl Reassembler {
     }
 
     fn consume(&mut self, count: usize) {
+        tracing::debug!(
+            "offset={}, count={}, buffer.len={}",
+            self.offset,
+            count,
+            self.buffer.len()
+        );
         assert!(self.offset + count <= self.buffer.len());
         self.offset += count;
         self.current_header = None;
-
-        if self.buffer.len() > 4096 {
-            tracing::trace!(
-                "Buffer is too large ({} bytes), shrinking it",
-                self.buffer.len()
-            );
-            let mut new_buffer = self.buffer.split_off(self.offset);
-            std::mem::swap(&mut new_buffer, &mut self.buffer);
-        }
     }
 
     pub fn push_data(&mut self, data: &[u8]) {
         self.buffer.extend_from_slice(data);
-        tracing::trace!("Adding {} bytes to buffer", data.len());
+        tracing::debug!(
+            "Adding {} bytes to buffer: new_len={}",
+            data.len(),
+            self.buffer.len()
+        );
     }
 
     /// If `self.current_header`, parses content in self.buffer to load
@@ -275,11 +280,7 @@ impl Reassembler {
         self.current_header.as_ref().ok_or_else(|| Error::NoData)
     }
 
-    fn get_restransmits(
-        &mut self,
-        data: &mut Vec<u8>,
-        expected_offset: u16,
-    ) -> Result<RetransmitHeader> {
+    fn get_restransmits(&mut self, data: &mut Vec<u8>) -> Result<RetransmitHeader> {
         self.load_header()?;
         let mut expected_id = *self.expected_id.as_ref().unwrap();
 
@@ -289,7 +290,7 @@ impl Reassembler {
                 "current_header = {:?}, expected_id={}, expected_offset={}",
                 current_header,
                 expected_id,
-                expected_offset
+                self.expected_offset
             );
 
             match current_header.id.cmp(&expected_id) {
@@ -310,7 +311,7 @@ impl Reassembler {
                 cmp::Ordering::Equal => {}
             }
 
-            match current_header.offset.cmp(&expected_offset) {
+            match current_header.offset.cmp(&self.expected_offset) {
                 cmp::Ordering::Less => {
                     tracing::trace!("Got already seen offset, skipping");
                     self.consume(current_header.size as usize);
@@ -318,8 +319,10 @@ impl Reassembler {
                 }
                 cmp::Ordering::Greater => {
                     tracing::warn!("Missed chunk of data");
-                    let start = expected_offset as usize;
+                    let start = self.expected_offset as usize;
                     let end = current_header.offset as usize;
+                    // Because we missed a chunk, we can go to the next session
+                    *self.expected_id.as_mut().unwrap() += 1;
                     return Err(Error::MissingData(start..end));
                 }
                 cmp::Ordering::Equal => {
@@ -339,26 +342,35 @@ impl Reassembler {
         Ok(header)
     }
 
+    /// Remove all used data from buffer
+    fn cleanup_buffer(&mut self) {
+        let mut new_buffer = self.buffer.split_off(self.offset);
+        self.offset = 0;
+        std::mem::swap(&mut new_buffer, &mut self.buffer);
+        tracing::debug!("Buffer cleaned: buffer.len={}", self.buffer.len());
+    }
+
     /// Reassemble and returns next data
-    pub fn get_next_data(&mut self) -> Result<Vec<u8>> {
-        let mut data = Vec::new();
-        let mut expected_offset = 0;
+    pub fn get_next_data(&mut self, data: &mut Vec<u8>) -> Result<()> {
+        // if self.expected_offset == 0 {
+        //     assert_eq!(data.len(), 0);
+        //     data.clear();
+        // }
 
         loop {
-            eprintln!("[BEFORE] expected_offset = {}", expected_offset);
-            let header = self.get_restransmits(&mut data, expected_offset)?;
-            eprintln!("[AFTER1] expected_offset = {}", expected_offset);
-            expected_offset += dbg!(header.size);
-            eprintln!("[AFTER2] expected_offset = {}", expected_offset);
-            if dbg!(expected_offset) == dbg!(header.total_size) {
+            let header = self.get_restransmits(data)?;
+            self.expected_offset += header.size;
+            if self.expected_offset == header.total_size {
                 break;
             }
         }
 
         // We just want to increment the `RetransmitHeader::id`
         *self.expected_id.as_mut().unwrap() += 1;
+        self.expected_offset = 0;
+        self.cleanup_buffer();
         tracing::debug!("Got complete message");
 
-        Ok(data)
+        Ok(())
     }
 }

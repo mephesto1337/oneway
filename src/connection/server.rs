@@ -17,7 +17,7 @@ pub struct Server {
     socket: UdpReader,
     config: Config,
     root: PathBuf,
-    handlers: HashMap<SocketAddr, ServerHandler>,
+    handlers: HashMap<SocketAddr, ClientHandler>,
 }
 
 impl Server {
@@ -43,11 +43,12 @@ impl Server {
         match self.handlers.entry(client_addr) {
             Entry::Vacant(vac) => {
                 log::info!("Creating new handler for {}", vac.key());
-                let mut handler = ServerHandler {
+                let mut handler = ClientHandler {
                     keep_alive: None,
                     root: self.root.clone(),
                     client_addr: vac.key().clone(),
                     reassembler: Reassembler::new(&self.config),
+                    data: Vec::new(),
                 };
                 handler.process_buffer(data).await;
                 vac.insert(handler);
@@ -67,14 +68,15 @@ impl Server {
     }
 }
 
-pub struct ServerHandler {
+pub struct ClientHandler {
     keep_alive: Option<u64>,
     client_addr: SocketAddr,
     reassembler: Reassembler,
+    data: Vec<u8>,
     root: PathBuf,
 }
 
-impl ServerHandler {
+impl ClientHandler {
     pub fn client_addr(&self) -> &SocketAddr {
         &self.client_addr
     }
@@ -233,13 +235,15 @@ impl ServerHandler {
 
     async fn process_buffer_internal(&mut self, buffer: &[u8]) -> Result<()> {
         self.reassembler.push_data(buffer);
-        match self.reassembler.get_next_data() {
-            Ok(data) => {
-                let (rest, message) = Message::from_wire(&data[..])?;
+
+        match self.reassembler.get_next_data(&mut self.data) {
+            Ok(()) => {
+                let (rest, message) = Message::from_wire(&self.data[..])?;
                 if !rest.is_empty() {
                     tracing::warn!("Got extra data at the end of the message");
-                    tracing::debug!("Extra data: {:x?}", rest);
+                    tracing::warn!("Extra data: {:x?}", rest);
                 }
+                self.data.clear();
                 self.process_message(message).await;
                 Ok(())
             }
