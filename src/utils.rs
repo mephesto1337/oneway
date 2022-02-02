@@ -1,3 +1,5 @@
+use std::fmt;
+
 pub(crate) enum Shutdown {
     Read,
     Write,
@@ -84,5 +86,24 @@ mod windows {
     pub(crate) fn get_random<T>() -> MaybeUninit<T> {
         let value: MaybeUninit<T> = MaybeUninit::uninit();
         value
+    }
+}
+
+pub struct Hex<'a>(&'a [u8]);
+
+impl<'a> Hex<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self(data)
+    }
+}
+
+impl fmt::Debug for Hex<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("\"")?;
+        for byte in self.0.iter() {
+            write!(f, "{:02x}", byte)?;
+        }
+        f.write_str("\"")?;
+        Ok(())
     }
 }
