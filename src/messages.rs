@@ -32,6 +32,7 @@ pub enum Message {
     FileChunk {
         filename: String,
         offset: u64,
+        content_size: u16,
         content: Vec<u8>,
     },
 
@@ -44,10 +45,10 @@ impl Message {
         match self {
             Self::FileChunk { ref filename, .. } => {
                 let mut prefix_size = size_of::<u8>(); // MesageKind
-                prefix_size += size_of::<u16>(); // Filename len
+                prefix_size += size_of::<u16>(); // filename len
                 prefix_size += filename.len(); // filename
                 prefix_size += size_of::<u64>(); // offset
-                prefix_size += size_of::<u16>(); // content len
+                prefix_size += size_of::<u16>(); // content_size
                 Some(mtu - prefix_size)
             }
             _ => None,
@@ -138,16 +139,17 @@ impl Wire<'_> for Message {
 
                 let (rest, offset) = context("Message/FileChunk/offeet", be_u64)(rest)?;
 
-                let (rest, content_len) = context("Message/FileChunk/content_len", be_u16)(rest)?;
+                let (rest, content_size) = context("Message/FileChunk/content_size", be_u16)(rest)?;
                 let (rest, content) = context(
                     "Message/FileChunk/content",
-                    map(take(content_len), |slice: &[u8]| slice.to_vec()),
+                    map(take(content_size as usize), |slice: &[u8]| slice.to_vec()),
                 )(rest)?;
                 Ok((
                     rest,
                     Self::FileChunk {
                         filename,
                         offset,
+                        content_size,
                         content,
                     },
                 ))
@@ -208,6 +210,7 @@ impl Wire<'_> for Message {
             Self::FileChunk {
                 ref filename,
                 ref offset,
+                ref content_size,
                 ref content,
             } => {
                 let mk = MessageKind::FileChunk.to_u8();
@@ -224,12 +227,12 @@ impl Wire<'_> for Message {
                 total_size += size_of_val(offset);
                 writer.write_all(&offset.to_be_bytes()[..])?;
 
-                let content_len: u16 = content.len().try_into()?;
-                total_size += size_of_val(&content_len);
-                writer.write_all(&content_len.to_be_bytes()[..])?;
+                total_size += size_of_val(content_size);
+                writer.write_all(&content_size.to_be_bytes()[..])?;
 
-                total_size += content.len();
-                writer.write_all(&content[..])?;
+                let buffer = &content[..*content_size as usize];
+                total_size += buffer.len();
+                writer.write_all(&buffer[..])?;
             }
             Self::Done => {
                 let mk = MessageKind::Done.to_u8();
