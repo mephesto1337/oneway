@@ -1,3 +1,5 @@
+use std::env;
+
 use oneway::connection::Server;
 use oneway::udp::UdpReader;
 use oneway::{Config, Result};
@@ -12,7 +14,7 @@ async fn main() -> Result<()> {
     let progname = args.next().unwrap();
     let config_path = args
         .next()
-        .expect(format!("Usage: {} CONFIG_FILE", progname));
+        .expect(&format!("Usage: {} CONFIG_FILE", progname));
 
     let config = Config::from_file(config_path)?;
 
