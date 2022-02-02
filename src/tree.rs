@@ -10,7 +10,7 @@ macro_rules! try_with_message {
         match $e {
             Ok(v) => v,
             Err(e) => {
-                log::warn!($fmt, $($args),*, e = e);
+                tracing::warn!($fmt, $($args),*, e = e);
                 continue $goto;
             }
         }
@@ -20,7 +20,7 @@ macro_rules! try_with_message {
         match $e {
             Ok(v) => v,
             Err(e) => {
-                log::warn!($fmt, $($args),*, e = e);
+                tracing::warn!($fmt, $($args),*, e = e);
                 continue;
             }
         }
@@ -56,7 +56,7 @@ pub fn find_files(
             let mut metadata = match entry.metadata() {
                 Ok(v) => v,
                 Err(e) => {
-                    log::warn!(
+                    tracing::warn!(
                         "Could not retrieve metadata for {}: {}",
                         current_entry.display(),
                         e
@@ -68,7 +68,7 @@ pub fn find_files(
             while follow_symlinks && metadata.is_symlink() {
                 current_entry = match fs::read_link(&current_entry) {
                     Ok(v) => {
-                        log::debug!("Read link {} -> {}", current_entry.display(), v.display());
+                        tracing::debug!("Read link {} -> {}", current_entry.display(), v.display());
                         if v.is_absolute() {
                             v
                         } else {
@@ -77,7 +77,7 @@ pub fn find_files(
                         }
                     }
                     Err(e) => {
-                        log::warn!("Could not read symlink {}: {}", current_entry.display(), e);
+                        tracing::warn!("Could not read symlink {}: {}", current_entry.display(), e);
                         continue 'next_entry;
                     }
                 };
@@ -92,7 +92,7 @@ pub fn find_files(
             let entry_is_already_processed = !collected_inodes.insert(inode);
 
             if entry_is_already_processed {
-                log::debug!(
+                tracing::debug!(
                     "Skipping {} as it has already been visited",
                     current_entry.display()
                 );
@@ -109,7 +109,7 @@ pub fn find_files(
                     if let Ok(relative_entry) = current_entry.strip_prefix(&root) {
                         entries.push(relative_entry.to_path_buf());
                     } else {
-                        log::warn!(
+                        tracing::warn!(
                             "{} is not in {}, skipping",
                             current_entry.display(),
                             root.display()

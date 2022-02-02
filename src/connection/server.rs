@@ -51,7 +51,7 @@ impl Server {
         let (size, client_addr) = self.socket.recv_from(&mut buffer[..]).await?;
 
         let sender = self.handlers.entry(client_addr).or_insert_with(|| {
-            log::info!("Creating new handler for {}", &client_addr);
+            tracing::info!("Creating new handler for {}", &client_addr);
             let (sender, receiver) = mpsc::channel(self.config.channel_size);
 
             let kill_tx = self.kill_tx.clone();
@@ -90,12 +90,12 @@ impl Server {
 
         buffer.truncate(size);
         if let Err(e) = sender.send(buffer).await {
-            log::warn!("Handler is gone for {}: {}", &client_addr, e);
+            tracing::warn!("Handler is gone for {}: {}", &client_addr, e);
             self.handlers.remove(&client_addr);
         }
 
         if let Ok(addr) = self.kill_rx.try_recv() {
-            log::info!("Removing handler for {}", &addr);
+            tracing::info!("Removing handler for {}", &addr);
             self.handlers.remove(&addr);
         }
 
@@ -225,7 +225,7 @@ impl ClientHandler {
     ) {
         async fn write_chunk_to_file(file: &mut File, offset: u64, content: &[u8]) -> Result<()> {
             if content.iter().all(|x| *x == 0) {
-                log::warn!("Go all zero chunk at {}", offset);
+                tracing::warn!("Go all zero chunk at {}", offset);
             }
             file.seek(SeekFrom::Start(offset)).await?;
             file.write_all(content).await?;

@@ -12,13 +12,13 @@ pub struct UdpReader(UdpSocket);
 impl UdpReader {
     /// The socket *must not* be connected
     pub fn new(s: UdpSocket) -> io::Result<Self> {
-        log::trace!("UdpReader::new");
+        tracing::trace!("UdpReader::new");
         use crate::utils::Shutdown;
 
         match crate::utils::shutdown(&s, Shutdown::Write) {
-            Ok(_) => log::debug!("Socket made read-only"),
+            Ok(_) => tracing::debug!("Socket made read-only"),
             Err(e) => {
-                log::warn!("Could not make socket read-only: {}", e);
+                tracing::warn!("Could not make socket read-only: {}", e);
             }
         }
         Ok(Self(s))

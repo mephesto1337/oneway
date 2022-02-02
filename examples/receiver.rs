@@ -17,13 +17,13 @@ async fn main() -> Result<()> {
         .expect(&format!("Usage: {} CONFIG_FILE", progname));
 
     let config = Config::from_file(config_path)?;
-    log::info!("config = {:?}", config);
+    tracing::info!("config = {:?}", config);
 
     let socket = UdpSocket::bind(config.address).await?;
-    log::info!("Waiting for new request");
+    tracing::info!("Waiting for new request");
 
     let mut server = Server::new_with_config(UdpReader::new(socket)?, config);
-    log::trace!("server created");
+    tracing::trace!("server created");
 
     server.serve_forever().await?;
 

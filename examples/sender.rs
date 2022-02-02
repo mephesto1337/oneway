@@ -18,12 +18,12 @@ async fn main() -> Result<()> {
         .expect(&format!("Usage: {} CONFIG_FILE", progname));
 
     let config = Config::from_file(config_path)?;
-    log::info!("config = {:?}", config);
+    tracing::info!("config = {:?}", config);
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect(&config.address).await?;
 
-    log::info!("Connected to {}", config.address);
+    tracing::info!("Connected to {}", config.address);
 
     let files = find_files(&config.root, false, |_| true)?;
     let mut client = Client::new_with_config(UdpWriter::new(socket)?, config);

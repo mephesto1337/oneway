@@ -74,7 +74,7 @@ impl Config {
             })?;
             match result {
                 Line::Key(key) => {
-                    log::warn!("Unknown key {:?}", key);
+                    tracing::warn!("Unknown key {:?}", key);
                 }
                 Line::KeyValue(key, value) => {
                     if key.eq_ignore_ascii_case("remission_count") {
@@ -92,7 +92,7 @@ impl Config {
                     } else if key.eq_ignore_ascii_case("key") {
                         todo!("parse key");
                     } else {
-                        log::warn!("Unknown key {:?}", key);
+                        tracing::warn!("Unknown key {:?}", key);
                     }
                 }
                 _ => {}
