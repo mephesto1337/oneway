@@ -31,4 +31,7 @@ root = data/
 
 ; Number of time to send a chunk of data
 remission_count = 3
+
+; Channel size for message transmission
+channel_size = 10
 ```
