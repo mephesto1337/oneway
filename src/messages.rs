@@ -1,4 +1,6 @@
 use crate::{Result, Wire};
+
+use std::fmt;
 use std::mem::{size_of, size_of_val};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,7 +10,7 @@ use nom::error::context;
 use nom::number::streaming::{be_u16, be_u64, be_u8};
 
 /// Message send from the client to server
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum Message {
     /// Hello message to start a new session
     Hello,
@@ -52,6 +54,44 @@ impl Message {
                 Some(mtu - prefix_size)
             }
             _ => None,
+        }
+    }
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hello => write!(f, "Hello"),
+            Self::KeepAlive(ka) => f.debug_tuple("KeepAlive").field(ka).finish(),
+            Self::CountFilesToUpload(count) => {
+                f.debug_tuple("CountFilesToUpload").field(count).finish()
+            }
+            Self::File {
+                filename,
+                created,
+                size,
+            } => f
+                .debug_struct("File")
+                .field("filename", filename)
+                .field("created", created)
+                .field("size", size)
+                .finish(),
+            Self::FileChunk {
+                filename,
+                offset,
+                content_size,
+                content,
+            } => f
+                .debug_struct("FileChunk")
+                .field("filename", filename)
+                .field("offset", offset)
+                .field("content_size", content_size)
+                .field(
+                    "content",
+                    &crate::utils::Hex::new(&content[..*content_size as usize]),
+                )
+                .finish(),
+            Self::Done => write!(f, "Done"),
         }
     }
 }
