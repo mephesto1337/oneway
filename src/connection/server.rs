@@ -1,4 +1,4 @@
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -12,12 +12,15 @@ use crate::{Error, Result, Wire};
 
 use tokio::fs::File;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 pub struct Server {
     socket: UdpReader,
     config: Config,
     root: PathBuf,
-    handlers: HashMap<SocketAddr, ClientHandler>,
+    handlers: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>,
+    kill_tx: mpsc::Sender<SocketAddr>,
+    kill_rx: mpsc::Receiver<SocketAddr>,
 }
 
 impl Server {
@@ -31,41 +34,69 @@ impl Server {
             cwd.join(config_root)
         };
 
+        let (kill_tx, kill_rx) = mpsc::channel(config.channel_size);
+
         Self {
             socket,
             config,
             root,
             handlers: HashMap::new(),
+            kill_tx,
+            kill_rx,
         }
     }
 
     pub async fn recv_message(&mut self) -> Result<()> {
         let mut buffer = vec![0u8; self.config.mtu];
         let (size, client_addr) = self.socket.recv_from(&mut buffer[..]).await?;
-        let data = &buffer[..size];
-        let key = client_addr.clone();
 
-        let done = match self.handlers.entry(client_addr) {
-            Entry::Vacant(vac) => {
-                log::info!("Creating new handler for {}", vac.key());
-                let mut handler = ClientHandler {
-                    keep_alive: None,
-                    root: self.root.clone(),
-                    client_addr: vac.key().clone(),
-                    reassembler: Reassembler::new(&self.config),
-                    data: Vec::new(),
-                    opened_files: HashMap::new(),
-                };
-                let done = handler.process_buffer(data).await;
-                vac.insert(handler);
-                done
-            }
-            Entry::Occupied(mut occ) => occ.get_mut().process_buffer(data).await,
-        };
+        let sender = self.handlers.entry(client_addr).or_insert_with(|| {
+            log::info!("Creating new handler for {}", &client_addr);
+            let (sender, receiver) = mpsc::channel(self.config.channel_size);
 
-        if done {
-            log::info!("Removing handler for {}", &key);
-            self.handlers.remove(&key);
+            let kill_tx = self.kill_tx.clone();
+            let mut handler = ClientHandler {
+                keep_alive: None,
+                root: self.root.clone(),
+                client_addr: client_addr.clone(),
+                reassembler: Reassembler::new(&self.config),
+                data: Vec::new(),
+                opened_files: HashMap::new(),
+                receiver,
+                kill_tx,
+            };
+
+            tokio::spawn(async move {
+                while let Some(buf) = handler.receiver.recv().await {
+                    let done = handler.process_buffer(&buf[..]).await;
+                    if done {
+                        break;
+                    }
+                }
+
+                if let Err(e) = handler.kill_tx.send(handler.client_addr).await {
+                    tracing::error!(
+                        "[{}] Could not notify server of my end: {}",
+                        handler.client_addr,
+                        e
+                    );
+                } else {
+                    tracing::info!("[{}] Handler done", handler.client_addr);
+                }
+            });
+
+            sender
+        });
+
+        buffer.truncate(size);
+        if let Err(e) = sender.send(buffer).await {
+            log::warn!("Handler is gone for {}: {}", &client_addr, e);
+            self.handlers.remove(&client_addr);
+        }
+
+        if let Ok(addr) = self.kill_rx.try_recv() {
+            log::info!("Removing handler for {}", &addr);
+            self.handlers.remove(&addr);
         }
 
         Ok(())
@@ -81,6 +112,8 @@ impl Server {
 pub struct ClientHandler {
     keep_alive: Option<u64>,
     client_addr: SocketAddr,
+    receiver: mpsc::Receiver<Vec<u8>>,
+    kill_tx: mpsc::Sender<SocketAddr>,
     reassembler: Reassembler,
     data: Vec<u8>,
     root: PathBuf,
@@ -161,7 +194,6 @@ impl ClientHandler {
             return;
         }
 
-        // tokio::spawn(async move {
         match create_file(&real_filename, size).await {
             Ok(f) => {
                 tracing::info!(
@@ -182,7 +214,6 @@ impl ClientHandler {
                 );
             }
         }
-        // });
     }
 
     async fn process_message_file_chunk(
@@ -211,7 +242,6 @@ impl ClientHandler {
         }
 
         let client_addr = self.client_addr().clone();
-        // tokio::spawn(async move {
         let buffer = &content[..content_size as usize];
         let f = match self.opened_files.get_mut(&id) {
             Some(f) => f,
@@ -238,7 +268,6 @@ impl ClientHandler {
                 offset
             );
         }
-        // });
     }
 
     async fn process_message_done(&mut self) {

@@ -12,6 +12,7 @@ pub struct Config {
     pub recv_timeout: Duration,
     pub address: SocketAddr,
     pub root: PathBuf,
+    pub channel_size: usize,
 
     #[cfg(feature = "encryption")]
     pub key: [u8; 32],
@@ -25,6 +26,7 @@ impl Default for Config {
             recv_timeout: Duration::from_secs(3),
             address: "0.0.0.0:0".parse().unwrap(),
             root: std::env::current_dir().expect("Cannot get CWD"),
+            channel_size: 10,
 
             #[cfg(feature = "encryption")]
             key: [0u8; 32],
@@ -85,6 +87,8 @@ impl Config {
                         config.address = value.parse()?;
                     } else if key.eq_ignore_ascii_case("root") {
                         config.root = PathBuf::from(value);
+                    } else if key.eq_ignore_ascii_case("channel_size") {
+                        config.channel_size = value.parse()?;
                     } else if key.eq_ignore_ascii_case("key") {
                         todo!("parse key");
                     } else {
