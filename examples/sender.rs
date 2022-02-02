@@ -18,7 +18,7 @@ async fn main() -> Result<()> {
         .expect(&format!("Usage: {} CONFIG_FILE", progname));
 
     let config = Config::from_file(config_path)?;
-    log::info!("config ={:?}", config);
+    log::info!("config = {:?}", config);
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect(&config.address).await?;
