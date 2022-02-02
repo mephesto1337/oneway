@@ -84,7 +84,7 @@ impl MessageKind {
     }
 }
 
-impl Wire for Message {
+impl Wire<'_> for Message {
     fn from_wire(input: &[u8]) -> Result<(&[u8], Self)> {
         let (rest, message_kind) =
             context("Message/kind", map_opt(be_u8, MessageKind::from_u8))(input)?;
