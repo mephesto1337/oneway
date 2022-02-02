@@ -1,4 +1,68 @@
 use std::fmt;
+use std::fs;
+use std::io;
+use std::path::Path;
+
+#[cfg(target_family = "unix")]
+fn get_unix_inode(path: &Path) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path)?;
+    Ok(metadata.ino())
+}
+
+#[cfg(target_os = "windows")]
+fn get_windows_inode(path: &Path) -> io::Result<u64> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::{AsRawHandle, RawHandle};
+
+    #[allow(non_camel_case_types)]
+    #[allow(non_snake_case)]
+    #[repr(C)]
+    struct BY_HANDLE_FILE_INFORMATION {
+        _FileAttributes: u32,
+        _CreationTime: u64,
+        _LastAccessTime: u64,
+        _LastWriteTime: u64,
+        _VolumeSerialNumber: u32,
+        _FileSizeHigh: u32,
+        _FileSizeLow: u32,
+        _NumberOfLinks: u32,
+        FileIndex: u64,
+    }
+    type BOOL = u32;
+    extern "C" {
+        fn GetFileInformationByHandle(
+            handle: RawHandle,
+            file_information: *mut BY_HANDLE_FILE_INFORMATION,
+        ) -> BOOL;
+    }
+
+    let file = fs::File::open(path)?;
+    let handle = file.as_raw_handle();
+    let mut file_information: MaybeUninit<BY_HANDLE_FILE_INFORMATION> = MaybeUninit::uninit();
+
+    // SAFETY: `handle` is a valid file handle and file_information has the right size
+    let ret = unsafe { GetFileInformationByHandle(handle, file_information.as_mut_ptr()) };
+    if ret == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: `GetFileInformationByHandle` returned `TRUE` so `file_information` is initialized
+    let file_information = unsafe { file_information.assume_init() };
+
+    Ok(file_information.FileIndex)
+}
+
+pub fn get_inode(path: &Path) -> io::Result<u64> {
+    #[cfg(target_family = "unix")]
+    let inode = get_unix_inode(path)?;
+
+    #[cfg(target_os = "windows")]
+    let inode = get_windows_inode(path)?;
+
+    Ok(inode)
+}
 
 pub(crate) enum Shutdown {
     Read,
