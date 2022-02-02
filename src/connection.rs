@@ -48,6 +48,7 @@ impl Client {
             self.config.mtu,
         )?;
         retransmit.send(&self.socket).await?;
+        tracing::trace!("Retransmits send");
 
         Ok(())
     }
@@ -71,7 +72,62 @@ impl Client {
     }
 
     async fn send_file(&mut self, file: &PathBuf) -> Result<()> {
-        let metadata = tokio::fs::symlink_metadata(file).await?;
+        let fullname = self.config.root.join(file);
+        let filename = file.to_string_lossy().to_string();
+
+        // Now its content
+        let mut f = tokio::fs::File::open(&fullname).await?;
+        let content = vec![0u8; self.config.mtu];
+
+        let mut message = Message::FileChunk {
+            filename,
+            offset: 0,
+            content_size: 0,
+            content,
+        };
+        // Avoid fragmentation and reassemble on the other size
+        let content_max_size = message
+            .get_max_content_size(crate::retransmit::max_payload_size(self.config.mtu))
+            .unwrap();
+
+        tracing::info!(
+            "content_max_size = {} (mtu = {})",
+            content_max_size,
+            self.config.mtu
+        );
+
+        loop {
+            match message {
+                Message::FileChunk {
+                    ref mut offset,
+                    ref mut content,
+                    ref mut content_size,
+                    ref filename,
+                } => {
+                    *offset = f.stream_position().await?;
+                    let size = f.read(&mut content[..content_max_size]).await?;
+                    if size == 0 {
+                        tracing::info!("File {} sent to server ({} bytes)", filename, *offset);
+                        break;
+                    }
+                    *content_size = size
+                        .try_into()
+                        .expect("This should fit into a u16 by construction");
+                    // if size != content_max_size {
+                    //     tracing::warn!("Incomplete read at offset {}", *offset);
+                    // }
+                }
+                _ => unreachable!(),
+            }
+            self.send_message(&message).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn send_file_creation(&mut self, file: &PathBuf) -> Result<()> {
+        let fullname = self.config.root.join(file);
+        let metadata = tokio::fs::symlink_metadata(&fullname).await?;
         let filename = file.to_string_lossy().to_string();
         let created = metadata.created()?;
         let size = metadata.len();
@@ -85,40 +141,6 @@ impl Client {
         .await?;
         tracing::debug!("Notify server of file {}", filename);
 
-        // Now its content
-        let mut f = tokio::fs::File::open(file).await?;
-        let content = vec![0u8; self.config.mtu];
-        let mut message = Message::FileChunk {
-            filename,
-            offset: 0,
-            content,
-        };
-        // Avoid fragmentation and reassemble on the other size
-        let content_size = message
-            .get_max_content_size(crate::retransmit::max_payload_size(self.config.mtu))
-            .unwrap();
-
-        loop {
-            match message {
-                Message::FileChunk {
-                    ref mut offset,
-                    ref mut content,
-                    ref filename,
-                } => {
-                    *offset = f.stream_position().await?;
-                    content.resize(content_size, 0);
-                    let size = f.read(&mut content[..]).await?;
-                    content.truncate(size);
-                    if size == 0 {
-                        tracing::info!("File {} sent to server ({} bytes)", filename, *offset);
-                        break;
-                    }
-                }
-                _ => unreachable!(),
-            }
-            self.send_message(&message).await?;
-        }
-
         Ok(())
     }
 
@@ -127,6 +149,10 @@ impl Client {
 
         self.send_message(&Message::CountFilesToUpload(files_count))
             .await?;
+
+        for file in files {
+            self.send_file_creation(file).await?;
+        }
 
         for file in files {
             self.send_file(file).await?;

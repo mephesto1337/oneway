@@ -167,15 +167,25 @@ impl ClientHandler {
         });
     }
 
-    async fn process_message_file_chunk(&self, filename: String, offset: u64, content: Vec<u8>) {
+    async fn process_message_file_chunk(
+        &self,
+        filename: String,
+        offset: u64,
+        content_size: u16,
+        content: Vec<u8>,
+    ) {
         async fn write_chunk_to_file(
             filename: &PathBuf,
             offset: u64,
-            content: Vec<u8>,
+            content: &[u8],
         ) -> Result<()> {
+            if content.iter().all(|x| *x == 0) {
+                log::warn!("Go all zero chunk at {}", offset);
+            }
             let mut f = OpenOptions::new().write(true).open(filename).await?;
             f.seek(SeekFrom::Start(offset)).await?;
-            f.write_all(&content[..]).await?;
+            f.write_all(content).await?;
+            // f.flush().await?;
 
             Ok(())
         }
@@ -188,8 +198,8 @@ impl ClientHandler {
         }
 
         tokio::spawn(async move {
-            let content_size = content.len();
-            if let Err(e) = write_chunk_to_file(&real_filename, offset, content).await {
+            let buffer = &content[..content_size as usize];
+            if let Err(e) = write_chunk_to_file(&real_filename, offset, buffer).await {
                 tracing::error!(
                     "[{}] Could not write chunk at offset 0x{:x} to {:?}: {}",
                     client_addr,
@@ -228,9 +238,10 @@ impl ClientHandler {
             Message::FileChunk {
                 filename,
                 offset,
+                content_size,
                 content,
             } => {
-                self.process_message_file_chunk(filename, offset, content)
+                self.process_message_file_chunk(filename, offset, content_size, content)
                     .await
             }
             Message::Done => self.process_message_done().await,
@@ -252,6 +263,14 @@ impl ClientHandler {
                 Ok(())
             }
             Err(Error::NoData) => Ok(()),
+            Err(Error::Deserialize(nom::Err::Incomplete(n))) => {
+                match n {
+                    nom::Needed::Unknown => tracing::trace!("Missing some bytes"),
+                    nom::Needed::Size(s) => tracing::trace!("Missing {} bytes", s),
+                }
+
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }
