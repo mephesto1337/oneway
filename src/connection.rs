@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::config::Config;
@@ -71,44 +72,44 @@ impl Client {
         Ok(())
     }
 
-    async fn send_file(&mut self, file: &PathBuf) -> Result<()> {
-        let fullname = self.config.root.join(file);
-        let filename = file.to_string_lossy().to_string();
-
-        // Now its content
-        let mut f = tokio::fs::File::open(&fullname).await?;
+    async fn send_file(&mut self, filename: &PathBuf, filepath: &PathBuf, id: u64) -> Result<()> {
+        let mut f = tokio::fs::File::open(filepath).await?;
         let content = vec![0u8; self.config.mtu];
 
         let mut message = Message::FileChunk {
-            filename,
+            id,
             offset: 0,
             content_size: 0,
             content,
         };
         // Avoid fragmentation and reassemble on the other size
-        let content_max_size = message
-            .get_max_content_size(crate::retransmit::max_payload_size(self.config.mtu))
-            .unwrap();
+        let content_max_size =
+            Message::get_max_content_size(crate::retransmit::max_payload_size(self.config.mtu));
+        let mut done = false;
 
-        tracing::info!(
+        tracing::debug!(
             "content_max_size = {} (mtu = {})",
             content_max_size,
             self.config.mtu
         );
 
-        loop {
+        while !done {
             match message {
                 Message::FileChunk {
                     ref mut offset,
                     ref mut content,
                     ref mut content_size,
-                    ref filename,
+                    ..
                 } => {
                     *offset = f.stream_position().await?;
                     let size = f.read(&mut content[..content_max_size]).await?;
                     if size == 0 {
-                        tracing::info!("File {} sent to server ({} bytes)", filename, *offset);
-                        break;
+                        tracing::info!(
+                            "File {} sent to server ({} bytes)",
+                            filename.display(),
+                            *offset
+                        );
+                        done = true;
                     }
                     *content_size = size
                         .try_into()
@@ -125,10 +126,14 @@ impl Client {
         Ok(())
     }
 
-    async fn send_file_creation(&mut self, file: &PathBuf) -> Result<()> {
-        let fullname = self.config.root.join(file);
-        let metadata = tokio::fs::symlink_metadata(&fullname).await?;
-        let filename = file.to_string_lossy().to_string();
+    async fn send_file_creation(
+        &mut self,
+        filename: &PathBuf,
+        filepath: &PathBuf,
+        id: u64,
+    ) -> Result<()> {
+        let metadata = tokio::fs::symlink_metadata(&filepath).await?;
+        let filename = filename.to_string_lossy().to_string();
         let created = metadata.created()?;
         let size = metadata.len();
 
@@ -137,6 +142,7 @@ impl Client {
             filename: filename.clone(),
             created,
             size,
+            id,
         })
         .await?;
         tracing::debug!("Notify server of file {}", filename);
@@ -146,16 +152,24 @@ impl Client {
 
     pub async fn send_files(&mut self, files: &[PathBuf]) -> Result<()> {
         let files_count = files.len().try_into()?;
+        let mut ids = HashMap::new();
 
         self.send_message(&Message::CountFilesToUpload(files_count))
             .await?;
 
         for file in files {
-            self.send_file_creation(file).await?;
+            let fullname = self.config.root.join(file);
+            let id = crate::utils::get_inode(&fullname)?;
+
+            tracing::debug!("{} => ({:?}, {})", file.display(), fullname, id);
+            ids.insert(file, (fullname, id));
+            let (fullname, _) = ids.get(file).unwrap();
+            self.send_file_creation(file, fullname, id).await?;
         }
 
         for file in files {
-            self.send_file(file).await?;
+            let (fullname, id) = ids.get(file).unwrap();
+            self.send_file(file, fullname, *id).await?;
         }
 
         Ok(())

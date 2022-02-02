@@ -10,7 +10,7 @@ use crate::retransmit::Reassembler;
 use crate::udp::UdpReader;
 use crate::{Error, Result, Wire};
 
-use tokio::fs::{File, OpenOptions};
+use tokio::fs::File;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 pub struct Server {
@@ -43,8 +43,9 @@ impl Server {
         let mut buffer = vec![0u8; self.config.mtu];
         let (size, client_addr) = self.socket.recv_from(&mut buffer[..]).await?;
         let data = &buffer[..size];
+        let key = client_addr.clone();
 
-        match self.handlers.entry(client_addr) {
+        let done = match self.handlers.entry(client_addr) {
             Entry::Vacant(vac) => {
                 log::info!("Creating new handler for {}", vac.key());
                 let mut handler = ClientHandler {
@@ -53,13 +54,18 @@ impl Server {
                     client_addr: vac.key().clone(),
                     reassembler: Reassembler::new(&self.config),
                     data: Vec::new(),
+                    opened_files: HashMap::new(),
                 };
-                handler.process_buffer(data).await;
+                let done = handler.process_buffer(data).await;
                 vac.insert(handler);
+                done
             }
-            Entry::Occupied(mut occ) => {
-                occ.get_mut().process_buffer(data).await;
-            }
+            Entry::Occupied(mut occ) => occ.get_mut().process_buffer(data).await,
+        };
+
+        if done {
+            log::info!("Removing handler for {}", &key);
+            self.handlers.remove(&key);
         }
 
         Ok(())
@@ -78,6 +84,7 @@ pub struct ClientHandler {
     reassembler: Reassembler,
     data: Vec<u8>,
     root: PathBuf,
+    opened_files: HashMap<u64, File>,
 }
 
 impl ClientHandler {
@@ -114,7 +121,13 @@ impl ClientHandler {
         );
     }
 
-    async fn process_message_file(&self, filename: String, _created: SystemTime, size: u64) {
+    async fn process_message_file(
+        &mut self,
+        filename: String,
+        _created: SystemTime,
+        size: u64,
+        id: u64,
+    ) {
         async fn create_directories(filename: &PathBuf) -> Result<()> {
             let parent = filename.parent().unwrap();
             match tokio::fs::symlink_metadata(parent).await {
@@ -133,12 +146,12 @@ impl ClientHandler {
             }
         }
 
-        async fn create_file(filename: &PathBuf, size: u64) -> Result<()> {
+        async fn create_file(filename: &PathBuf, size: u64) -> Result<File> {
             create_directories(filename).await?;
             let f = File::create(filename).await?;
             f.set_len(size).await?;
 
-            Ok::<(), Error>(())
+            Ok(f)
         }
 
         let client_addr = self.client_addr().clone();
@@ -148,82 +161,91 @@ impl ClientHandler {
             return;
         }
 
-        tokio::spawn(async move {
-            if let Err(e) = create_file(&real_filename, size).await {
+        // tokio::spawn(async move {
+        match create_file(&real_filename, size).await {
+            Ok(f) => {
+                tracing::info!(
+                    "[{}] Created file {} of {} bytes (id: 0x{:x})",
+                    client_addr,
+                    real_filename.display(),
+                    size,
+                    id
+                );
+                self.opened_files.insert(id, f);
+            }
+            Err(e) => {
                 tracing::error!(
                     "[{}] Could not create file {}: {}",
                     client_addr,
                     real_filename.display(),
                     e
                 );
-            } else {
-                tracing::info!(
-                    "[{}] Created file {} of {} bytes",
-                    client_addr,
-                    real_filename.display(),
-                    size
-                );
             }
-        });
+        }
+        // });
     }
 
     async fn process_message_file_chunk(
-        &self,
-        filename: String,
+        &mut self,
+        id: u64,
         offset: u64,
         content_size: u16,
         content: Vec<u8>,
     ) {
-        async fn write_chunk_to_file(
-            filename: &PathBuf,
-            offset: u64,
-            content: &[u8],
-        ) -> Result<()> {
+        async fn write_chunk_to_file(file: &mut File, offset: u64, content: &[u8]) -> Result<()> {
             if content.iter().all(|x| *x == 0) {
                 log::warn!("Go all zero chunk at {}", offset);
             }
-            let mut f = OpenOptions::new().write(true).open(filename).await?;
-            f.seek(SeekFrom::Start(offset)).await?;
-            f.write_all(content).await?;
+            file.seek(SeekFrom::Start(offset)).await?;
+            file.write_all(content).await?;
             // f.flush().await?;
 
             Ok(())
         }
 
-        let client_addr = self.client_addr().clone();
-        let real_filename = self.root.join(&filename);
-        if !real_filename.starts_with(&self.root) {
-            tracing::warn!("File {} not in {}, ignoring", filename, self.root.display());
+        // If content_size is 0, then the file has been sent
+        if content_size == 0 {
+            tracing::info!("Done receiving 0x{:x}", id);
+            self.opened_files.remove(&id);
             return;
         }
 
-        tokio::spawn(async move {
-            let buffer = &content[..content_size as usize];
-            if let Err(e) = write_chunk_to_file(&real_filename, offset, buffer).await {
-                tracing::error!(
-                    "[{}] Could not write chunk at offset 0x{:x} to {:?}: {}",
-                    client_addr,
-                    offset,
-                    real_filename.display(),
-                    e
-                );
-            } else {
-                tracing::debug!(
-                    "[{}] Write {} bytes into {} at {}",
-                    client_addr,
-                    content_size,
-                    real_filename.display(),
-                    offset
-                );
+        let client_addr = self.client_addr().clone();
+        // tokio::spawn(async move {
+        let buffer = &content[..content_size as usize];
+        let f = match self.opened_files.get_mut(&id) {
+            Some(f) => f,
+            None => {
+                tracing::error!("[{}] File with id {} was not opened", client_addr, id);
+                return;
             }
-        });
+        };
+
+        if let Err(e) = write_chunk_to_file(f, offset, buffer).await {
+            tracing::error!(
+                "[{}] Could not write chunk at offset 0x{:x} to {:?}: {}",
+                client_addr,
+                offset,
+                id,
+                e
+            );
+        } else {
+            tracing::debug!(
+                "[{}] Write {} bytes into {} at {}",
+                client_addr,
+                content_size,
+                id,
+                offset
+            );
+        }
+        // });
     }
 
     async fn process_message_done(&mut self) {
         tracing::info!("[{}] Received done from client", self.client_addr());
     }
 
-    pub async fn process_message(&mut self, message: Message) {
+    pub async fn process_message(&mut self, message: Message) -> bool {
         match message {
             Message::Hello => self.process_message_hello().await,
             Message::KeepAlive(id) => self.process_message_keep_alive(id).await,
@@ -234,21 +256,27 @@ impl ClientHandler {
                 filename,
                 created,
                 size,
-            } => self.process_message_file(filename, created, size).await,
+                id,
+            } => self.process_message_file(filename, created, size, id).await,
             Message::FileChunk {
-                filename,
+                id,
                 offset,
                 content_size,
                 content,
             } => {
-                self.process_message_file_chunk(filename, offset, content_size, content)
+                self.process_message_file_chunk(id, offset, content_size, content)
                     .await
             }
-            Message::Done => self.process_message_done().await,
+            Message::Done => {
+                self.process_message_done().await;
+                return true;
+            }
         }
+
+        return false;
     }
 
-    async fn process_buffer_internal(&mut self, buffer: &[u8]) -> Result<()> {
+    async fn process_buffer_internal(&mut self, buffer: &[u8]) -> Result<bool> {
         self.reassembler.push_data(buffer);
 
         match self.reassembler.get_next_data(&mut self.data) {
@@ -259,25 +287,29 @@ impl ClientHandler {
                     tracing::warn!("Extra data: {:x?}", rest);
                 }
                 self.data.clear();
-                self.process_message(message).await;
-                Ok(())
+                let done = self.process_message(message).await;
+                Ok(done)
             }
-            Err(Error::NoData) => Ok(()),
+            Err(Error::NoData) => Ok(false),
             Err(Error::Deserialize(nom::Err::Incomplete(n))) => {
                 match n {
                     nom::Needed::Unknown => tracing::trace!("Missing some bytes"),
                     nom::Needed::Size(s) => tracing::trace!("Missing {} bytes", s),
                 }
 
-                Ok(())
+                Ok(false)
             }
             Err(e) => Err(e),
         }
     }
 
-    pub async fn process_buffer(&mut self, buffer: &[u8]) {
-        if let Err(e) = self.process_buffer_internal(buffer).await {
-            tracing::error!("[{}] error: {}", self.client_addr(), e);
+    pub async fn process_buffer(&mut self, buffer: &[u8]) -> bool {
+        match self.process_buffer_internal(buffer).await {
+            Ok(done) => done,
+            Err(e) => {
+                tracing::error!("[{}] error: {}", self.client_addr(), e);
+                true
+            }
         }
     }
 }

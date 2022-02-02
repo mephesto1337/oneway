@@ -26,13 +26,14 @@ pub enum Message {
         filename: String,
         created: SystemTime,
         size: u64,
+        id: u64,
     },
 
     /// A chunk of data from a file
     /// Files are sent from chunks if we want to transmit a verry large file that would involve
     /// reassemble of all packets and store them in memory before writing.
     FileChunk {
-        filename: String,
+        id: u64,
         offset: u64,
         content_size: u16,
         content: Vec<u8>,
@@ -43,18 +44,12 @@ pub enum Message {
 }
 
 impl Message {
-    pub fn get_max_content_size(&self, mtu: usize) -> Option<usize> {
-        match self {
-            Self::FileChunk { ref filename, .. } => {
-                let mut prefix_size = size_of::<u8>(); // MesageKind
-                prefix_size += size_of::<u16>(); // filename len
-                prefix_size += filename.len(); // filename
-                prefix_size += size_of::<u64>(); // offset
-                prefix_size += size_of::<u16>(); // content_size
-                Some(mtu - prefix_size)
-            }
-            _ => None,
-        }
+    pub const fn get_max_content_size(mtu: usize) -> usize {
+        let mut prefix_size = size_of::<u8>(); // MesageKind
+        prefix_size += size_of::<u64>(); // filename id
+        prefix_size += size_of::<u64>(); // offset
+        prefix_size += size_of::<u16>(); // content_size
+        mtu - prefix_size
     }
 }
 
@@ -70,20 +65,22 @@ impl fmt::Debug for Message {
                 filename,
                 created,
                 size,
+                id,
             } => f
                 .debug_struct("File")
                 .field("filename", filename)
                 .field("created", created)
                 .field("size", size)
+                .field("id", id)
                 .finish(),
             Self::FileChunk {
-                filename,
+                id,
                 offset,
                 content_size,
                 content,
             } => f
                 .debug_struct("FileChunk")
-                .field("filename", filename)
+                .field("id", id)
                 .field("offset", offset)
                 .field("content_size", content_size)
                 .field(
@@ -158,24 +155,20 @@ impl Wire<'_> for Message {
 
                 let (rest, size) = context("Message/File/size", be_u64)(rest)?;
 
+                let (rest, id) = context("Message/File/id", be_u64)(rest)?;
+
                 Ok((
                     rest,
                     Self::File {
                         filename,
                         created,
                         size,
+                        id,
                     },
                 ))
             }
             MessageKind::FileChunk => {
-                let (rest, filename_len) = context("Message/FileChunk/filename_len", be_u16)(rest)?;
-                let (rest, filename) = context(
-                    "Message/FileChunk/filename",
-                    map(
-                        map_res(take(filename_len), std::str::from_utf8),
-                        String::from,
-                    ),
-                )(rest)?;
+                let (rest, id) = context("Message/FileChunk/id", be_u64)(rest)?;
 
                 let (rest, offset) = context("Message/FileChunk/offeet", be_u64)(rest)?;
 
@@ -187,7 +180,7 @@ impl Wire<'_> for Message {
                 Ok((
                     rest,
                     Self::FileChunk {
-                        filename,
+                        id,
                         offset,
                         content_size,
                         content,
@@ -228,6 +221,7 @@ impl Wire<'_> for Message {
                 ref filename,
                 ref created,
                 ref size,
+                ref id,
             } => {
                 let mk = MessageKind::File.to_u8();
                 total_size += size_of_val(&mk);
@@ -246,9 +240,12 @@ impl Wire<'_> for Message {
 
                 total_size += size_of_val(size);
                 writer.write_all(&size.to_be_bytes()[..])?;
+
+                total_size += size_of_val(id);
+                writer.write_all(&id.to_be_bytes()[..])?;
             }
             Self::FileChunk {
-                ref filename,
+                ref id,
                 ref offset,
                 ref content_size,
                 ref content,
@@ -257,12 +254,8 @@ impl Wire<'_> for Message {
                 total_size += size_of_val(&mk);
                 writer.write_all(&[mk])?;
 
-                let filename_len: u16 = filename.len().try_into()?;
-                total_size += size_of_val(&filename_len);
-                writer.write_all(&filename_len.to_be_bytes()[..])?;
-
-                total_size += filename.as_bytes().len();
-                writer.write_all(filename.as_bytes())?;
+                total_size += size_of_val(id);
+                writer.write_all(&id.to_be_bytes()[..])?;
 
                 total_size += size_of_val(offset);
                 writer.write_all(&offset.to_be_bytes()[..])?;
