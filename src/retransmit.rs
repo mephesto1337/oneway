@@ -155,19 +155,28 @@ impl Reassembler {
         &self.buffer[self.offset..]
     }
 
-    fn get_available_data_len(&self) -> usize {
-        self.get_available_data().len()
-    }
-
     fn consume(&mut self, count: usize) {
         assert!(self.offset + count <= self.buffer.len());
         self.offset += count;
 
         if self.offset * 2 > self.buffer.capacity() {
+            #[cfg(debug_assertions)]
+            let old = self.get_available_data().to_vec();
+
             let mut new_buffer = Vec::with_capacity(self.mtu * 2);
             new_buffer.extend_from_slice(self.get_available_data());
             std::mem::swap(&mut new_buffer, &mut self.buffer);
             self.offset = 0;
+
+            #[cfg(debug_assertions)]
+            if old != self.get_available_data() {
+                tracing::error!("Old = {:?}", crate::utils::Hex::new(&old[..]));
+                tracing::error!(
+                    "New = {:?}",
+                    crate::utils::Hex::new(self.get_available_data())
+                );
+                panic!("DEAD");
+            }
         }
     }
 
@@ -185,31 +194,28 @@ impl Reassembler {
         data.clear();
         // We could re-parse the header each time, but it is so small and cheap that caching it
         // would not worth it
-        while self.get_available_data_len() > RetransmitHeader::size() {
-            let (rest, header) = RetransmitHeader::from_wire(self.get_available_data())?;
-            let size = header.size as usize;
-            if rest.len() < size {
-                return Err(Error::NoData);
+        loop {
+            let (_rest, retransmit) = RetransmitHeader::from_wire(self.get_available_data())?;
+            // let retransmit_len = retransmit.len();
+            // data.extend_from_slice(retransmit.data);
+            // self.consume(retransmit_len);
+            // return Ok(());
+
+            if &self.previous_chunk[..] == retransmit.data {
+                // If we just yield this chunk, ignore it but still consume the chunk from our
+                // buffer
+                let retransmit_len = retransmit.len();
+                self.consume(retransmit_len);
             } else {
-                let chunk = &rest[..size];
-                if &self.previous_chunk[..] == chunk {
-                    // If we just yield this chunk, ignore it but still consume the chunk from our
-                    // buffer
-                    self.consume(RetransmitHeader::size() + size);
+                // The chunk does not match the previous one
+                data.extend_from_slice(retransmit.data);
+                let mut previous_chunk = retransmit.data.to_vec();
+                let retransmit_len = retransmit.len();
+                self.consume(retransmit_len);
+                std::mem::swap(&mut self.previous_chunk, &mut previous_chunk);
 
-                    continue;
-                } else {
-                    // The chunk does not match the previous one
-                    data.extend_from_slice(chunk);
-                    self.previous_chunk.clear();
-                    self.previous_chunk.extend_from_slice(&data[..]);
-                    self.consume(RetransmitHeader::size() + size);
-
-                    return Ok(());
-                }
+                return Ok(());
             }
         }
-
-        Err(Error::NoData)
     }
 }
