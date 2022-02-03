@@ -23,6 +23,16 @@ impl Client {
     pub fn new_with_config(socket: UdpWriter, config: Config) -> Self {
         // SAFETY: any memory representation of a u64 is a valid one
         let keep_alive = unsafe { crate::utils::get_random().assume_init() };
+
+        let content_max_size =
+            Message::get_max_content_size(crate::retransmit::max_payload_size(config.mtu));
+
+        tracing::info!(
+            "content_max_size = {} (mtu = {})",
+            content_max_size,
+            config.mtu
+        );
+
         Self {
             socket,
             config,
@@ -83,12 +93,6 @@ impl Client {
         let content_max_size =
             Message::get_max_content_size(crate::retransmit::max_payload_size(self.config.mtu));
         let mut done = false;
-
-        tracing::debug!(
-            "content_max_size = {} (mtu = {})",
-            content_max_size,
-            self.config.mtu
-        );
 
         while !done {
             match message {
