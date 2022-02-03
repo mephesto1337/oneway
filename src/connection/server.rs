@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::config::Config;
@@ -16,7 +17,7 @@ use tokio::sync::mpsc;
 
 pub struct Server {
     socket: UdpReader,
-    config: Config,
+    config: Arc<Config>,
     root: PathBuf,
     handlers: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>,
     kill_tx: mpsc::Sender<SocketAddr>,
@@ -38,7 +39,7 @@ impl Server {
 
         Self {
             socket,
-            config,
+            config: Arc::new(config),
             root,
             handlers: HashMap::new(),
             kill_tx,
@@ -64,6 +65,7 @@ impl Server {
                 opened_files: HashMap::new(),
                 receiver,
                 kill_tx,
+                config: Arc::clone(&self.config),
             };
 
             tokio::spawn(async move {
@@ -117,7 +119,8 @@ pub struct ClientHandler {
     reassembler: Reassembler,
     data: Vec<u8>,
     root: PathBuf,
-    opened_files: HashMap<u64, File>,
+    opened_files: HashMap<u64, (File, u64)>,
+    config: Arc<Config>,
 }
 
 impl ClientHandler {
@@ -177,7 +180,7 @@ impl ClientHandler {
                     size,
                     id
                 );
-                self.opened_files.insert(id, f);
+                self.opened_files.insert(id, (f, 0));
             }
             Err(e) => {
                 tracing::error!(
@@ -197,27 +200,51 @@ impl ClientHandler {
         content_size: u16,
         content: Vec<u8>,
     ) {
-        async fn write_chunk_to_file(file: &mut File, offset: u64, content: &[u8]) -> Result<()> {
+        async fn write_chunk_to_file(
+            file: &mut File,
+            file_offset: &mut u64,
+            offset: u64,
+            content: &[u8],
+        ) -> Result<()> {
             if content.iter().all(|x| *x == 0) {
-                tracing::warn!("Go all zero chunk at {}", offset);
+                tracing::warn!("Got all zero chunk at {}", offset);
             }
-            file.seek(SeekFrom::Start(offset)).await?;
+
+            if *file_offset != offset {
+                if *file_offset > offset {
+                    tracing::warn!(
+                        "Must have missed a chunk. Expected {}, got {} ({} bytes behind)",
+                        *file_offset,
+                        offset,
+                        *file_offset - offset
+                    );
+                } else {
+                    tracing::warn!(
+                        "Must have missed a chunk. Expected {}, got {} ({} bytes ahead)",
+                        *file_offset,
+                        offset,
+                        offset - *file_offset
+                    );
+                }
+                *file_offset = file.seek(SeekFrom::Start(offset)).await?;
+            }
             file.write_all(content).await?;
+            *file_offset += content.len() as u64;
             // f.flush().await?;
 
             Ok(())
         }
 
+        let client_addr = self.client_addr().clone();
+
         // If content_size is 0, then the file has been sent
         if content_size == 0 {
-            tracing::info!("Done receiving 0x{:x}", id);
+            tracing::info!("[{}] Done receiving 0x{:x}", self.client_addr, id);
             self.opened_files.remove(&id);
             return;
         }
 
-        let client_addr = self.client_addr().clone();
-        let buffer = &content[..content_size as usize];
-        let f = match self.opened_files.get_mut(&id) {
+        let (f, file_offset) = match self.opened_files.get_mut(&id) {
             Some(f) => f,
             None => {
                 tracing::error!("[{}] File with id {} was not opened", client_addr, id);
@@ -225,21 +252,15 @@ impl ClientHandler {
             }
         };
 
-        if let Err(e) = write_chunk_to_file(f, offset, buffer).await {
+        // Is content contiguous to out internal buffer?
+        let buffer = &content[..content_size as usize];
+        if let Err(e) = write_chunk_to_file(f, file_offset, offset, buffer).await {
             tracing::error!(
                 "[{}] Could not write chunk at offset 0x{:x} to {:?}: {}",
                 client_addr,
                 offset,
                 id,
                 e
-            );
-        } else {
-            tracing::debug!(
-                "[{}] Write {} bytes into {} at {}",
-                client_addr,
-                content_size,
-                id,
-                offset
             );
         }
     }
