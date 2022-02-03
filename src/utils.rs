@@ -1,13 +1,14 @@
 use std::fmt;
-use std::fs;
 use std::io;
 use std::path::Path;
+
+pub mod fs;
 
 #[cfg(target_family = "unix")]
 fn get_unix_inode(path: &Path) -> io::Result<u64> {
     use std::os::unix::fs::MetadataExt;
 
-    let metadata = fs::metadata(path)?;
+    let metadata = std::fs::metadata(path)?;
     Ok(metadata.ino())
 }
 
@@ -38,7 +39,7 @@ fn get_windows_inode(path: &Path) -> io::Result<u64> {
         ) -> BOOL;
     }
 
-    let file = fs::File::open(path)?;
+    let file = std::fs::File::open(path)?;
     let handle = file.as_raw_handle();
     let mut file_information: MaybeUninit<BY_HANDLE_FILE_INFORMATION> = MaybeUninit::uninit();
 

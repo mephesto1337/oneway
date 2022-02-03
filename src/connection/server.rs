@@ -161,32 +161,6 @@ impl ClientHandler {
         size: u64,
         id: u64,
     ) {
-        async fn create_directories(filename: &PathBuf) -> Result<()> {
-            let parent = filename.parent().unwrap();
-            match tokio::fs::symlink_metadata(parent).await {
-                Ok(metadata) => {
-                    assert!(metadata.is_dir());
-                    Ok(())
-                }
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        tokio::fs::create_dir_all(parent).await?;
-                        Ok(())
-                    } else {
-                        Err(e.into())
-                    }
-                }
-            }
-        }
-
-        async fn create_file(filename: &PathBuf, size: u64) -> Result<File> {
-            create_directories(filename).await?;
-            let f = File::create(filename).await?;
-            f.set_len(size).await?;
-
-            Ok(f)
-        }
-
         let client_addr = self.client_addr().clone();
         let real_filename = self.root.join(&filename);
         if !real_filename.starts_with(&self.root) {
@@ -194,7 +168,7 @@ impl ClientHandler {
             return;
         }
 
-        match create_file(&real_filename, size).await {
+        match crate::utils::fs::create_file(&real_filename, size).await {
             Ok(f) => {
                 tracing::info!(
                     "[{}] Created file {} of {} bytes (id: 0x{:x})",
